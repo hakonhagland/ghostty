@@ -198,6 +198,26 @@ pub const CommandPalette = extern struct {
             }
         }.lessThan);
 
+        // The most recently used surface is the one we are sitting in right
+        // now, and jumping to where you already are is never what you want.
+        // Demote it by one so that the entry under the cursor on open is the
+        // last place you were.
+        //
+        // This is a post-sort fixup rather than a rule in the comparator
+        // because "the focused entry sorts second" is not a strict weak
+        // ordering, and an ill-formed comparator is not safe to hand to sort.
+        if (commands.items.len >= 2) demote: {
+            const first = commands.items[0];
+            if (!first.isJump()) break :demote;
+            if (!commands.items[1].isJump()) break :demote;
+
+            const surface = first.getJumpSurface() orelse break :demote;
+            defer surface.unref();
+            if (!surface.getFocused()) break :demote;
+
+            std.mem.swap(*Command, &commands.items[0], &commands.items[1]);
+        }
+
         for (commands.items) |cmd| {
             const cmd_ref = cmd.as(gobject.Object);
             priv.source.append(cmd_ref);
@@ -269,9 +289,30 @@ pub const CommandPalette = extern struct {
     }
 
     /// Compare two commands for sorting.
-    /// Sorts alphabetically by title (case-insensitive), with colon normalization
-    /// so "Foo:" sorts before "Foo Bar:". Uses sort_key as tie-breaker.
+    ///
+    /// Jump commands sort above all regular commands, and amongst themselves
+    /// by most recently used first. The palette is opened to navigate between
+    /// terminals far more often than to run a configured action, so the
+    /// terminals belong at the top where they can be reached without typing.
+    ///
+    /// Regular commands sort alphabetically by title (case-insensitive), with
+    /// colon normalization so "Foo:" sorts before "Foo Bar:".
     fn compareCommands(a: *Command, b: *Command) bool {
+        // Jump commands first, most recently used first amongst themselves.
+        switch (a.private().data) {
+            .jump => |*ja| switch (b.private().data) {
+                .jump => |*jb| {
+                    if (ja.sort_key == jb.sort_key) return false;
+                    return ja.sort_key > jb.sort_key;
+                },
+                .regular => return true,
+            },
+            .regular => switch (b.private().data) {
+                .jump => return false,
+                .regular => {},
+            },
+        }
+
         const a_title = a.propGetTitle() orelse return false;
         const b_title = b.propGetTitle() orelse return true;
 
@@ -294,17 +335,9 @@ pub const CommandPalette = extern struct {
             return a_title.len < b_title.len;
         }
 
-        // Titles are equal - use sort_key as tie-breaker if both are jump commands
-        const a_sort_key = switch (a.private().data) {
-            .regular => return false,
-            .jump => |*ja| ja.sort_key,
-        };
-        const b_sort_key = switch (b.private().data) {
-            .regular => return false,
-            .jump => |*jb| jb.sort_key,
-        };
-
-        return a_sort_key < b_sort_key;
+        // Both are regular commands with equal titles. Jump commands never
+        // reach here; they are fully ordered by the switch above.
+        return false;
     }
 
     fn close(self: *CommandPalette) void {
@@ -577,7 +610,12 @@ const Command = extern struct {
             surface: WeakRef(Surface) = .empty,
             title: ?[:0]const u8 = null,
             description: ?[:0]const u8 = null,
-            sort_key: usize,
+
+            /// The surface's focus sequence, captured when this command was
+            /// built. Higher means more recently used. Captured rather than
+            /// read live so that the ordering cannot shift underneath the
+            /// user while the palette is open.
+            sort_key: u64,
         };
     };
 
@@ -607,8 +645,7 @@ const Command = extern struct {
 
         const priv = self.private();
         priv.data = .{
-            // Surface should be initialized at this point.
-            .jump = .{ .sort_key = surface.core().?.id },
+            .jump = .{ .sort_key = surface.getFocusSeq() },
         };
         priv.data.jump.surface.set(surface);
 
