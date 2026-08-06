@@ -194,6 +194,12 @@ pub const Application = extern struct {
         /// only be set by the main loop thread.
         running: bool = false,
 
+        /// Monotonic counter handed out by `nextFocusSeq`. Surfaces stamp
+        /// themselves from this on focus so that they can be ordered by how
+        /// recently they were used. Zero is never handed out, so it doubles
+        /// as "never focused".
+        focus_seq: u64 = 0,
+
         /// The timer used to quit the application after the last window is
         /// closed. Even if there is no quit delay set, this is the state
         /// used to determine to close the app.
@@ -828,6 +834,22 @@ pub const Application = extern struct {
     /// Returns the apprt application associated with this application.
     pub fn rt(self: *Self) *ApprtApp {
         return self.private().rt_app;
+    }
+
+    /// Returns the next value of the monotonic focus sequence.
+    ///
+    /// Surfaces stamp themselves with this whenever they gain focus, which
+    /// gives us a total ordering of surfaces by how recently they were used.
+    /// The sequence is app-wide so that the ordering is consistent across
+    /// windows.
+    ///
+    /// The counter is only ever incremented, so wrapping is not a practical
+    /// concern: at one focus change per nanosecond it would take over 500
+    /// years to exhaust a u64.
+    pub fn nextFocusSeq(self: *Self) u64 {
+        const priv = self.private();
+        priv.focus_seq += 1;
+        return priv.focus_seq;
     }
 
     /// Returns the app winproto implementation.

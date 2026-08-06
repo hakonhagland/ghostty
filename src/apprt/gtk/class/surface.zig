@@ -612,6 +612,12 @@ pub const Surface = extern struct {
         /// focus events.
         focused: bool = true,
 
+        /// The value of the application-wide focus sequence at the time this
+        /// surface last gained focus, used to order surfaces by how recently
+        /// they were used. Seeded at realize time so that a surface which has
+        /// never been focused still orders after older ones.
+        focus_seq: u64 = 0,
+
         /// Whether the GLArea widget is mapped. Some operations like grabbing
         /// focus only work if a widget is mapped.
         mapped: bool = false,
@@ -1818,6 +1824,11 @@ pub const Surface = extern struct {
         priv.size = .{ .width = 0, .height = 0 };
         priv.vadj_signal_group = null;
 
+        // Seed the focus sequence at creation. A surface that is created but
+        // never focused (e.g. a background split) then still orders after
+        // older surfaces rather than falling to the very bottom.
+        priv.focus_seq = Application.default().nextFocusSeq();
+
         // If our configuration is null then we get the configuration
         // from the application.
         if (priv.config == null) {
@@ -2127,6 +2138,14 @@ pub const Surface = extern struct {
     /// Returns the focus state of this surface.
     pub fn getFocused(self: *Self) bool {
         return self.private().focused;
+    }
+
+    /// Returns the focus sequence of this surface: the value of the
+    /// application-wide counter when this surface last gained focus. Higher
+    /// means more recently used. Only meaningful when compared against the
+    /// sequence of another surface.
+    pub fn getFocusSeq(self: *Self) u64 {
+        return self.private().focus_seq;
     }
 
     /// Returns true if the GLArea of this surface is mapped.
@@ -2807,6 +2826,11 @@ pub const Surface = extern struct {
     fn updateFocus(self: *Self, focused: bool) void {
         const priv = self.private();
         priv.focused = focused;
+
+        // Stamp ourselves on focus gain so that we can be ordered against
+        // other surfaces by recency of use. We deliberately do not stamp on
+        // focus loss: the value must record when we were last *entered*.
+        if (focused) priv.focus_seq = Application.default().nextFocusSeq();
 
         const ctx = priv.im_context.as(gtk.IMContext);
         if (focused) ctx.focusIn() else ctx.focusOut();
