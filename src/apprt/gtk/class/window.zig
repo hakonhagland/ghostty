@@ -28,6 +28,7 @@ const Surface = @import("surface.zig").Surface;
 const Tab = @import("tab.zig").Tab;
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
+const splitProjectTitle = @import("command_palette.zig").splitProjectTitle;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
 
@@ -425,6 +426,50 @@ pub const Window = extern struct {
         });
     }
 
+    /// Create a new tab in this window with a manually set title.
+    ///
+    /// If the title names a project (`project:name`) that some existing tab
+    /// already belongs to, the new tab starts in that project's most recently
+    /// used working directory. Otherwise it inherits from the active surface
+    /// as a new tab normally would.
+    pub fn newTabTitled(self: *Self, title: [:0]const u8) void {
+        const parent = if (self.getActiveSurface()) |v| v.core() else null;
+
+        const cwd: ?[:0]const u8 = cwd: {
+            const project = splitProjectTitle(title)[0] orelse
+                break :cwd null;
+
+            // Look across every window, matching what the palette lists.
+            var best: ?*Surface = null;
+            var best_seq: u64 = 0;
+            for (Application.default().core().surfaces.items) |rt_surface| {
+                const surface = rt_surface.gobj();
+
+                const tab = ext.getAncestor(
+                    Tab,
+                    surface.as(gtk.Widget),
+                ) orelse continue;
+
+                const other = tab.getTitleOverride() orelse continue;
+                const other_project = splitProjectTitle(other)[0] orelse
+                    continue;
+                if (!std.mem.eql(u8, other_project, project)) continue;
+
+                const seq = surface.getFocusSeq();
+                if (best == null or seq > best_seq) {
+                    best = surface;
+                    best_seq = seq;
+                }
+            }
+
+            break :cwd (best orelse break :cwd null).getPwd();
+        };
+
+        const page = self.newTabPage(parent, .tab, .{ .working_directory = cwd });
+        const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
+        tab.setTitleOverride(title);
+    }
+
     pub fn newTabForWindow(
         self: *Self,
         parent_: ?*CoreSurface,
@@ -482,6 +527,14 @@ pub const Window = extern struct {
                 surfaceInit(p.rt_surface.gobj(), self);
             }
             tab.setParentWithContext(p, context);
+        }
+
+        // Setting a parent overwrites the working directory with the parent's
+        // when the config asks for inheritance, so an explicit working
+        // directory has to be reapplied afterwards to win. The surface is not
+        // realized yet, so this still affects where the child process starts.
+        if (overrides.working_directory) |wd| {
+            if (tab.getActiveSurface()) |surface| surface.setPwd(wd);
         }
 
         // Get the position that we should insert the new tab at.

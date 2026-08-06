@@ -15,6 +15,7 @@ Adw.Dialog dialog {
       Gtk.SearchEntry search {
         hexpand: true;
         placeholder-text: _("Execute a command…");
+        search-changed => $search_changed();
         stop-search => $search_stopped();
         activate => $search_activated();
 

@@ -23,6 +23,28 @@ const Config = @import("config.zig").Config;
 
 const log = std.log.scoped(.gtk_ghostty_command_palette);
 
+/// Split a manually set tab title into its project and name parts.
+///
+/// A tab title of "web:server" means project "web", name "server". A title
+/// with no colon has no project.
+///
+/// This is only ever applied to a title the user typed themselves. The
+/// terminal-reported title must never be split, because colons are common in
+/// it: the shell integration reports the running command, so "ssh host:port"
+/// or "docker run img:tag" would otherwise be torn in half.
+pub fn splitProjectTitle(title: []const u8) struct { ?[]const u8, []const u8 } {
+    const idx = std.mem.indexOfScalar(u8, title, ':') orelse
+        return .{ null, title };
+
+    const project = std.mem.trim(u8, title[0..idx], " ");
+    const name = std.mem.trim(u8, title[idx + 1 ..], " ");
+
+    // A leading or trailing colon is not a project, it's just a title.
+    if (project.len == 0 or name.len == 0) return .{ null, title };
+
+    return .{ project, name };
+}
+
 pub const CommandPalette = extern struct {
     const Self = @This();
     parent_instance: Parent,
@@ -99,6 +121,14 @@ pub const CommandPalette = extern struct {
         /// This is where all command data is ultimately stored.
         source: *gio.ListStore,
 
+        /// The synthetic "create a terminal" row, when the query is non-empty
+        /// in jump mode. Kept here so it can be replaced as the query changes.
+        create_cmd: ?*Command = null,
+
+        /// The window this palette was last presented over, which is where a
+        /// newly created terminal goes.
+        window: WeakRef(Window) = .empty,
+
         pub var offset: c_int = 0;
     };
 
@@ -162,6 +192,12 @@ pub const CommandPalette = extern struct {
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
 
+        // You MUST clear every weak ref here. The target keeps a pointer to the
+        // GWeakRef itself, and finalizing the target walks that list and takes
+        // a lock inside each entry — so if this object's memory has been freed
+        // by then, the target locks whatever now occupies it and can block
+        // forever. `inspector_window.zig` carries the same warning.
+        priv.window.set(null);
         priv.source.removeAll();
 
         if (priv.config) |config| {
@@ -214,6 +250,10 @@ pub const CommandPalette = extern struct {
 
         // Clear existing binds
         priv.source.removeAll();
+        if (priv.create_cmd) |cmd| {
+            cmd.unref();
+            priv.create_cmd = null;
+        }
 
         const alloc = Application.default().allocator();
         var commands: std.ArrayList(*Command) = .empty;
@@ -336,16 +376,20 @@ pub const CommandPalette = extern struct {
     /// colon normalization so "Foo:" sorts before "Foo Bar:".
     fn compareCommands(a: *Command, b: *Command) bool {
         // Jump commands first, most recently used first amongst themselves.
+        // The synthetic create row always sorts last so that it never steals
+        // the default selection from a real terminal.
         switch (a.private().data) {
+            .create => return false,
             .jump => |*ja| switch (b.private().data) {
                 .jump => |*jb| {
                     if (ja.sort_key == jb.sort_key) return false;
                     return ja.sort_key > jb.sort_key;
                 },
-                .regular => return true,
+                .regular, .create => return true,
             },
             .regular => switch (b.private().data) {
                 .jump => return false,
+                .create => return true,
                 .regular => {},
             },
         }
@@ -386,6 +430,48 @@ pub const CommandPalette = extern struct {
         self.unref();
     }
 
+    fn searchChanged(_: *gtk.SearchEntry, self: *CommandPalette) callconv(.c) void {
+        self.syncCreateCommand();
+    }
+
+    /// Keep the synthetic "create a terminal" row in step with the query.
+    ///
+    /// The row is offered whenever the query is non-empty, not only when
+    /// nothing matches: otherwise you could never create "web" while
+    /// "web-old" still matched. Its label repeats the query so that it keeps
+    /// passing the search filter.
+    fn syncCreateCommand(self: *CommandPalette) void {
+        const priv = self.private();
+
+        // Remove the previous one, if any. It is always the last entry, but
+        // look it up properly rather than relying on that.
+        if (priv.create_cmd) |cmd| {
+            var pos: c_uint = 0;
+            if (priv.source.find(cmd.as(gobject.Object), &pos) != 0) {
+                priv.source.remove(pos);
+            }
+            cmd.unref();
+            priv.create_cmd = null;
+        }
+
+        // Creating from the palette only makes sense when it is being used to
+        // switch terminals.
+        if (priv.mode != .jump) return;
+
+        const config = priv.config orelse return;
+        const text = std.mem.span(priv.search.as(gtk.Editable).getText());
+        const query = std.mem.trim(u8, text, " ");
+        if (query.len == 0) return;
+
+        const cmd = Command.newCreate(config, query) catch |err| {
+            log.warn("failed to create the create-terminal row: {}", .{err});
+            return;
+        };
+
+        priv.create_cmd = cmd;
+        priv.source.append(cmd.as(gobject.Object));
+    }
+
     fn searchStopped(_: *gtk.SearchEntry, self: *CommandPalette) callconv(.c) void {
         // ESC was pressed - close the palette
         self.close();
@@ -413,6 +499,9 @@ pub const CommandPalette = extern struct {
             self.close();
             return;
         }
+
+        // Remember where a newly created terminal should go.
+        priv.window.set(window);
 
         // Show the dialog
         priv.dialog.present(window.as(gtk.Widget));
@@ -443,6 +532,15 @@ pub const CommandPalette = extern struct {
             const surface = cmd.getJumpSurface() orelse return;
             defer surface.unref();
             surface.present();
+            return;
+        }
+
+        // The synthetic create row makes a new terminal named after the query.
+        if (cmd.isCreate()) {
+            const query = cmd.getCreateQuery() orelse return;
+            const window = priv.window.get() orelse return;
+            defer window.unref();
+            window.newTabTitled(query);
             return;
         }
 
@@ -492,6 +590,7 @@ pub const CommandPalette = extern struct {
             // Template Callbacks
             class.bindTemplateCallback("closed", &dialogClosed);
             class.bindTemplateCallback("notify_config", &propConfig);
+            class.bindTemplateCallback("search_changed", &searchChanged);
             class.bindTemplateCallback("search_stopped", &searchStopped);
             class.bindTemplateCallback("search_activated", &searchActivated);
             class.bindTemplateCallback("row_activated", &rowActivated);
@@ -699,6 +798,17 @@ const Command = extern struct {
         pub const CommandData = union(enum) {
             regular: RegularData,
             jump: JumpData,
+            create: CreateData,
+        };
+
+        /// A synthetic row offering to create a terminal named after whatever
+        /// the user has typed so far.
+        pub const CreateData = struct {
+            /// The typed text, which becomes the new tab's title.
+            query: [:0]const u8,
+
+            /// The row label, e.g. `Create tab "web:server"`.
+            title: ?[:0]const u8 = null,
         };
 
         pub const RegularData = struct {
@@ -747,6 +857,20 @@ const Command = extern struct {
         return self;
     }
 
+    /// Create the synthetic row that offers to create a terminal named
+    /// after the current query.
+    pub fn newCreate(config: *Config, query: []const u8) Allocator.Error!*Self {
+        const self = gobject.ext.newInstance(Self, .{ .config = config });
+        errdefer self.unref();
+
+        const priv = self.private();
+        priv.data = .{ .create = .{
+            .query = try priv.arena.allocator().dupeZ(u8, query),
+        } };
+
+        return self;
+    }
+
     /// Create a new jump command that focuses a specific surface.
     pub fn newJump(config: *Config, surface: *Surface) *Self {
         const self = gobject.ext.newInstance(Self, .{
@@ -780,7 +904,7 @@ const Command = extern struct {
         }
 
         switch (priv.data) {
-            .regular => {},
+            .regular, .create => {},
             .jump => |*j| {
                 j.surface.deinit();
             },
@@ -810,7 +934,7 @@ const Command = extern struct {
 
         const regular = switch (priv.data) {
             .regular => |*r| r,
-            .jump => return null,
+            .jump, .create => return null,
         };
 
         if (regular.action_key) |action_key| return action_key;
@@ -830,7 +954,7 @@ const Command = extern struct {
 
         const regular = switch (priv.data) {
             .regular => |*r| r,
-            .jump => return null,
+            .jump, .create => return null,
         };
 
         if (regular.action) |action| return action;
@@ -848,28 +972,6 @@ const Command = extern struct {
         };
 
         return regular.action;
-    }
-
-    /// Split a manually set tab title into its project and name parts.
-    ///
-    /// A tab title of "web:server" means project "web", name "server". A title
-    /// with no colon has no project.
-    ///
-    /// This is only ever applied to a title the user typed themselves. The
-    /// terminal-reported title must never be split, because colons are common
-    /// in it: the shell integration reports the running command, so "ssh
-    /// host:port" or "docker run img:tag" would otherwise be torn in half.
-    fn splitProject(title: []const u8) struct { ?[]const u8, []const u8 } {
-        const idx = std.mem.indexOfScalar(u8, title, ':') orelse
-            return .{ null, title };
-
-        const project = std.mem.trim(u8, title[0..idx], " ");
-        const name = std.mem.trim(u8, title[idx + 1 ..], " ");
-
-        // A leading or trailing colon is not a project, it's just a title.
-        if (project.len == 0 or name.len == 0) return .{ null, title };
-
-        return .{ project, name };
     }
 
     /// Compute and cache the project/name split for a jump entry.
@@ -894,7 +996,7 @@ const Command = extern struct {
         };
 
         if (override) |title| {
-            const project, const name = splitProject(title);
+            const project, const name = splitProjectTitle(title);
             if (project) |p| j.project = alloc.dupeZ(u8, p) catch null;
             j.title = alloc.dupeZ(u8, name) catch null;
             return;
@@ -909,6 +1011,18 @@ const Command = extern struct {
 
         switch (priv.data) {
             .regular => |*r| return r.command.title,
+            .create => |*c| {
+                if (c.title) |t| return t;
+                c.title = std.fmt.allocPrintSentinel(
+                    priv.arena.allocator(),
+                    // The query is repeated in the label so that the row keeps
+                    // matching the search filter as the user types.
+                    "Create terminal \"{s}\"",
+                    .{c.query},
+                    0,
+                ) catch null;
+                return c.title;
+            },
             .jump => |*j| {
                 // Deliberately no "Focus: " prefix. The title is what the
                 // search filter matches against, so a constant prefix on every
@@ -924,7 +1038,7 @@ const Command = extern struct {
         const priv = self.private();
 
         switch (priv.data) {
-            .regular => return null,
+            .regular, .create => return null,
             .jump => |*j| {
                 self.parseJumpTitle(j);
                 return j.project;
@@ -943,6 +1057,7 @@ const Command = extern struct {
 
         switch (priv.data) {
             .regular => return self.propGetActionKey(),
+            .create => return null,
             .jump => |*j| {
                 if (j.subtitle) |v| return v;
 
@@ -976,6 +1091,7 @@ const Command = extern struct {
 
         switch (priv.data) {
             .regular => |*r| return r.command.description,
+            .create => return null,
             .jump => |*j| {
                 if (j.description) |desc| return desc;
 
@@ -1006,7 +1122,7 @@ const Command = extern struct {
         const priv = self.private();
         return switch (priv.data) {
             .regular => |*r| r.command.action,
-            .jump => null,
+            .jump, .create => null,
         };
     }
 
@@ -1016,12 +1132,27 @@ const Command = extern struct {
         return priv.data == .jump;
     }
 
+    /// Check if this is the synthetic "create a terminal" row.
+    pub fn isCreate(self: *Self) bool {
+        const priv = self.private();
+        return priv.data == .create;
+    }
+
+    /// The text the user had typed when this create row was built.
+    pub fn getCreateQuery(self: *Self) ?[:0]const u8 {
+        const priv = self.private();
+        return switch (priv.data) {
+            .regular, .jump => null,
+            .create => |*c| c.query,
+        };
+    }
+
     /// Get the jump surface. Returns a strong reference that the caller
     /// must unref when done, or null if the surface has been destroyed.
     pub fn getJumpSurface(self: *Self) ?*Surface {
         const priv = self.private();
         return switch (priv.data) {
-            .regular => null,
+            .regular, .create => null,
             .jump => |*j| j.surface.get(),
         };
     }
