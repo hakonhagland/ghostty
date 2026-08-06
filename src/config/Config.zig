@@ -6994,6 +6994,13 @@ pub const Keybinds = struct {
             .toggle_command_palette,
         );
 
+        // Toggle session search
+        try self.set.put(
+            alloc,
+            .{ .key = .{ .unicode = 'k' }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .toggle_session_search,
+        );
+
         // Mac-specific keyboard bindings.
         if (comptime builtin.target.os.tag.isDarwin()) {
             try self.set.put(

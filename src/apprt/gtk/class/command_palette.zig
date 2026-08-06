@@ -7,6 +7,7 @@ const gio = @import("gio");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
+const i18n = @import("../../../os/main.zig").i18n;
 const input = @import("../../../input.zig");
 const gresource = @import("../build/gresource.zig");
 const key = @import("../key.zig");
@@ -63,9 +64,22 @@ pub const CommandPalette = extern struct {
         };
     };
 
+    /// What the palette shows.
+    pub const Mode = enum {
+        /// Everything: the open terminals plus the configured commands.
+        all,
+
+        /// Only the open terminals. Used for switching between terminals
+        /// without the configured commands in the way.
+        jump,
+    };
+
     const Private = struct {
         /// The configuration that this command palette is using.
         config: ?*Config = null,
+
+        /// What this palette is currently showing.
+        mode: Mode = .all,
 
         /// The dialog object containing the palette UI.
         dialog: *adw.Dialog,
@@ -167,13 +181,34 @@ pub const CommandPalette = extern struct {
     //---------------------------------------------------------------
     // Signal Handlers
 
+    /// Set what this palette shows. Repopulating is deferred until we have a
+    /// config, so that this can be called immediately after construction
+    /// without tripping the "no config" warning below.
+    pub fn setMode(self: *CommandPalette, mode: Mode) void {
+        const priv = self.private();
+        if (priv.mode == mode) return;
+        priv.mode = mode;
+        if (priv.config != null) self.refresh();
+    }
+
     fn propConfig(self: *CommandPalette, _: *gobject.ParamSpec, _: ?*anyopaque) callconv(.c) void {
+        self.refresh();
+    }
+
+    fn refresh(self: *CommandPalette) void {
         const priv = self.private();
 
         const config = priv.config orelse {
             log.warn("command palette does not have a config!", .{});
             return;
         };
+
+        // The placeholder tells the user what this invocation will search.
+        priv.search.as(gtk.Editable).setText("");
+        priv.search.setPlaceholderText(switch (priv.mode) {
+            .all => i18n._("Execute a command…"),
+            .jump => i18n._("Switch to a terminal…"),
+        });
 
         // Clear existing binds
         priv.source.removeAll();
@@ -189,7 +224,7 @@ pub const CommandPalette = extern struct {
             log.warn("failed to collect jump commands: {}", .{err});
         };
 
-        self.collectRegularCommands(config, &commands, alloc);
+        if (priv.mode == .all) self.collectRegularCommands(config, &commands, alloc);
 
         // Sort commands
         std.mem.sort(*Command, commands.items, {}, struct {
@@ -754,12 +789,11 @@ const Command = extern struct {
                 const alloc = priv.arena.allocator();
                 const effective_title = surface.getEffectiveTitle() orelse "Untitled";
 
-                j.title = std.fmt.allocPrintSentinel(
-                    alloc,
-                    "Focus: {s}",
-                    .{effective_title},
-                    0,
-                ) catch null;
+                // Deliberately no "Focus: " prefix. The title is what the
+                // search filter matches against, so a constant prefix on every
+                // terminal is dead weight that also makes "foc" match all of
+                // them. Jump entries are distinguished visually instead.
+                j.title = alloc.dupeZ(u8, effective_title) catch null;
 
                 return j.title;
             },

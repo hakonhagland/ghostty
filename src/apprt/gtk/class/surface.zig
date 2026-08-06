@@ -903,6 +903,11 @@ pub const Surface = extern struct {
         return self.as(gtk.Widget).activateAction("win.toggle-command-palette", null) != 0;
     }
 
+    pub fn toggleSessionSearch(self: *Self) bool {
+        // TODO: pass the surface with the action
+        return self.as(gtk.Widget).activateAction("win.toggle-session-search", null) != 0;
+    }
+
     pub fn controlInspector(
         self: *Self,
         value: apprt.Action.Value(.inspector),

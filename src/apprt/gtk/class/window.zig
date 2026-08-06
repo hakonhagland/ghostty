@@ -394,6 +394,7 @@ pub const Window = extern struct {
             .init("clear", actionClear, null),
             // TODO: accept the surface that toggled the command palette
             .init("toggle-command-palette", actionToggleCommandPalette, null),
+            .init("toggle-session-search", actionToggleSessionSearch, null),
             .init("toggle-inspector", actionToggleInspector, null),
         };
 
@@ -2187,15 +2188,18 @@ pub const Window = extern struct {
     /// Toggle the command palette.
     ///
     /// TODO: accept the surface that toggled the command palette as a parameter
-    fn toggleCommandPalette(self: *Window) void {
+    fn toggleCommandPalette(self: *Window, mode: CommandPalette.Mode) void {
         const priv = self.private();
 
         // Get a reference to a command palette. First check the weak reference
         // that we save to see if we already have one stored. If we don't then
         // create a new one.
         const command_palette = priv.command_palette.get() orelse command_palette: {
-            // Create a fresh command palette.
+            // Create a fresh command palette. The mode is set before the
+            // config is bound so that the initial population below already
+            // reflects it.
             const command_palette = CommandPalette.new();
+            command_palette.setMode(mode);
 
             // Synchronize our config to the command palette's config.
             _ = gobject.Object.bindProperty(
@@ -2224,6 +2228,10 @@ pub const Window = extern struct {
         };
         defer command_palette.unref();
 
+        // A palette that survived from a previous invocation may have been
+        // opened in the other mode.
+        command_palette.setMode(mode);
+
         // Tell the command palette to toggle itself. If the dialog gets
         // presented (instead of hidden) it will be modal over our window.
         command_palette.toggle(self);
@@ -2243,7 +2251,16 @@ pub const Window = extern struct {
     ) callconv(.c) void {
         // TODO: accept the surface that toggled the command palette as a
         // parameter
-        self.toggleCommandPalette();
+        self.toggleCommandPalette(.all);
+    }
+
+    /// React to a GTK action requesting that the session search be toggled.
+    fn actionToggleSessionSearch(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        self.toggleCommandPalette(.jump);
     }
 
     /// Toggle the Ghostty inspector for the active surface.
