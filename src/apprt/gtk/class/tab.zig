@@ -255,6 +255,12 @@ pub const Tab = extern struct {
 
     /// Overridden title. This will be generally be shown over the title
     /// unless this is unset (null).
+    /// The manually set title for this tab, if the user has set one. This is
+    /// only the user's own text; it is never the terminal-reported title.
+    pub fn getTitleOverride(self: *Self) ?[:0]const u8 {
+        return self.private().title_override;
+    }
+
     pub fn setTitleOverride(self: *Self, title: ?[:0]const u8) void {
         const priv = self.private();
         if (priv.title_override) |v| glib.free(@ptrCast(@constCast(v)));

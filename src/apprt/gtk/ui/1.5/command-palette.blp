@@ -69,21 +69,41 @@ Adw.Dialog dialog {
                 orientation: vertical;
                 hexpand: true;
 
-                Gtk.Label {
-                  ellipsize: end;
-                  halign: start;
-                  wrap: false;
-                  single-line-mode: true;
+                Gtk.Box {
+                  orientation: horizontal;
+                  spacing: 6;
 
-                  styles [
-                    "title",
-                  ]
+                  Gtk.Label {
+                    ellipsize: end;
+                    halign: start;
+                    wrap: false;
+                    single-line-mode: true;
+                    visible: bind template.item as <$GhosttyCommand>.has-project;
 
-                  label: bind template.item as <$GhosttyCommand>.title;
+                    styles [
+                      "title",
+                      "accent",
+                    ]
+
+                    label: bind template.item as <$GhosttyCommand>.project;
+                  }
+
+                  Gtk.Label {
+                    ellipsize: end;
+                    halign: start;
+                    wrap: false;
+                    single-line-mode: true;
+
+                    styles [
+                      "title",
+                    ]
+
+                    label: bind template.item as <$GhosttyCommand>.title;
+                  }
                 }
 
                 Gtk.Label {
-                  ellipsize: end;
+                  ellipsize: start;
                   halign: start;
                   wrap: false;
                   single-line-mode: true;
@@ -93,7 +113,7 @@ Adw.Dialog dialog {
                     "monospace",
                   ]
 
-                  label: bind template.item as <$GhosttyCommand>.action-key;
+                  label: bind template.item as <$GhosttyCommand>.subtitle;
                 }
               }
 

@@ -4,11 +4,13 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 
 const adw = @import("adw");
 const gio = @import("gio");
+const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const i18n = @import("../../../os/main.zig").i18n;
 const input = @import("../../../input.zig");
+const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const key = @import("../key.zig");
 const WeakRef = @import("../weak_ref.zig").WeakRef;
@@ -621,6 +623,70 @@ const Command = extern struct {
                 },
             );
         };
+
+        /// The project a terminal belongs to, taken from the part of a
+        /// manually set tab title before the first colon. Null for regular
+        /// commands and for tabs with no manually set title.
+        pub const project = struct {
+            pub const name = "project";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        ?[:0]const u8,
+                        .{
+                            .getter = propGetProject,
+                            .getter_transfer = .none,
+                        },
+                    ),
+                },
+            );
+        };
+
+        /// Whether `project` is set. Exists so that the row template can bind
+        /// the project label's visibility without needing a closure.
+        pub const @"has-project" = struct {
+            pub const name = "has-project";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                bool,
+                .{
+                    .default = false,
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        bool,
+                        .{ .getter = propGetHasProject },
+                    ),
+                },
+            );
+        };
+
+        /// The second line of a row: the keybind action for a regular command,
+        /// or the working directory for a terminal.
+        pub const subtitle = struct {
+            pub const name = "subtitle";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        ?[:0]const u8,
+                        .{
+                            .getter = propGetSubtitle,
+                            .getter_transfer = .none,
+                        },
+                    ),
+                },
+            );
+        };
     };
 
     pub const Private = struct {
@@ -645,6 +711,15 @@ const Command = extern struct {
             surface: WeakRef(Surface) = .empty,
             title: ?[:0]const u8 = null,
             description: ?[:0]const u8 = null,
+
+            /// Lazily computed and then cached, like `title`. `parsed` marks
+            /// that the split has been attempted, since a null `project` is a
+            /// legitimate result.
+            project: ?[:0]const u8 = null,
+            parsed: bool = false,
+
+            /// The working directory, abbreviated for display.
+            subtitle: ?[:0]const u8 = null,
 
             /// The surface's focus sequence, captured when this command was
             /// built. Higher means more recently used. Captured rather than
@@ -775,27 +850,123 @@ const Command = extern struct {
         return regular.action;
     }
 
+    /// Split a manually set tab title into its project and name parts.
+    ///
+    /// A tab title of "web:server" means project "web", name "server". A title
+    /// with no colon has no project.
+    ///
+    /// This is only ever applied to a title the user typed themselves. The
+    /// terminal-reported title must never be split, because colons are common
+    /// in it: the shell integration reports the running command, so "ssh
+    /// host:port" or "docker run img:tag" would otherwise be torn in half.
+    fn splitProject(title: []const u8) struct { ?[]const u8, []const u8 } {
+        const idx = std.mem.indexOfScalar(u8, title, ':') orelse
+            return .{ null, title };
+
+        const project = std.mem.trim(u8, title[0..idx], " ");
+        const name = std.mem.trim(u8, title[idx + 1 ..], " ");
+
+        // A leading or trailing colon is not a project, it's just a title.
+        if (project.len == 0 or name.len == 0) return .{ null, title };
+
+        return .{ project, name };
+    }
+
+    /// Compute and cache the project/name split for a jump entry.
+    fn parseJumpTitle(self: *Self, j: *Private.JumpData) void {
+        if (j.parsed) return;
+        j.parsed = true;
+
+        const priv = self.private();
+        const alloc = priv.arena.allocator();
+
+        const surface = j.surface.get() orelse return;
+        defer surface.unref();
+
+        // Only a manually set *tab* title participates in the project
+        // convention. Fall back to the surface's effective title otherwise.
+        const override = tab: {
+            const tab = ext.getAncestor(
+                Tab,
+                surface.as(gtk.Widget),
+            ) orelse break :tab null;
+            break :tab tab.getTitleOverride();
+        };
+
+        if (override) |title| {
+            const project, const name = splitProject(title);
+            if (project) |p| j.project = alloc.dupeZ(u8, p) catch null;
+            j.title = alloc.dupeZ(u8, name) catch null;
+            return;
+        }
+
+        const effective_title = surface.getEffectiveTitle() orelse "Untitled";
+        j.title = alloc.dupeZ(u8, effective_title) catch null;
+    }
+
     fn propGetTitle(self: *Self) ?[:0]const u8 {
         const priv = self.private();
 
         switch (priv.data) {
             .regular => |*r| return r.command.title,
             .jump => |*j| {
-                if (j.title) |title| return title;
-
-                const surface = j.surface.get() orelse return null;
-                defer surface.unref();
-
-                const alloc = priv.arena.allocator();
-                const effective_title = surface.getEffectiveTitle() orelse "Untitled";
-
                 // Deliberately no "Focus: " prefix. The title is what the
                 // search filter matches against, so a constant prefix on every
                 // terminal is dead weight that also makes "foc" match all of
                 // them. Jump entries are distinguished visually instead.
-                j.title = alloc.dupeZ(u8, effective_title) catch null;
-
+                self.parseJumpTitle(j);
                 return j.title;
+            },
+        }
+    }
+
+    fn propGetProject(self: *Self) ?[:0]const u8 {
+        const priv = self.private();
+
+        switch (priv.data) {
+            .regular => return null,
+            .jump => |*j| {
+                self.parseJumpTitle(j);
+                return j.project;
+            },
+        }
+    }
+
+    fn propGetHasProject(self: *Self) bool {
+        return self.propGetProject() != null;
+    }
+
+    /// The second line of a row: the keybind action for a regular command, or
+    /// the working directory for a terminal.
+    fn propGetSubtitle(self: *Self) ?[:0]const u8 {
+        const priv = self.private();
+
+        switch (priv.data) {
+            .regular => return self.propGetActionKey(),
+            .jump => |*j| {
+                if (j.subtitle) |v| return v;
+
+                const surface = j.surface.get() orelse return null;
+                defer surface.unref();
+
+                const pwd = surface.getPwd() orelse return null;
+                const alloc = priv.arena.allocator();
+
+                // Abbreviate the home directory to "~", matching what macOS
+                // already does for its own jump entries.
+                const home = std.mem.span(glib.getHomeDir());
+                if (home.len > 0 and std.mem.startsWith(u8, pwd, home)) {
+                    j.subtitle = std.fmt.allocPrintSentinel(
+                        alloc,
+                        "~{s}",
+                        .{pwd[home.len..]},
+                        0,
+                    ) catch null;
+                } else {
+                    j.subtitle = alloc.dupeZ(u8, pwd) catch null;
+                }
+
+                return j.subtitle;
             },
         }
     }
@@ -875,6 +1046,9 @@ const Command = extern struct {
                 properties.action.impl,
                 properties.title.impl,
                 properties.description.impl,
+                properties.project.impl,
+                properties.@"has-project".impl,
+                properties.subtitle.impl,
             });
 
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);
