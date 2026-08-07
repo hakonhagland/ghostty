@@ -115,6 +115,32 @@ pub const CommandPalette = extern struct {
                 .detail = "config",
             },
         );
+
+        // Keep the selection on the best match as the query changes. See
+        // `resetSelection` for why this is needed.
+        _ = gtk.SearchEntry.signals.search_changed.connect(
+            self.private().search,
+            *Self,
+            resetSelection,
+            self,
+            .{},
+        );
+    }
+
+    /// Move the selection back to the first row.
+    ///
+    /// The list view is `single-click-activate`, which GTK documents as
+    /// "activate rows on single click and select them on hover". Hover
+    /// therefore moves the *selection*, not just the highlight, and Enter
+    /// activates the selection. A pointer left resting anywhere over the list
+    /// silently hijacks what Enter does, including across a change of query
+    /// that reorders the results underneath it.
+    ///
+    /// Re-selecting the first row whenever the query changes keeps the
+    /// keyboard path predictable: after typing, Enter always activates the
+    /// best match.
+    fn resetSelection(_: *gtk.SearchEntry, self: *Self) callconv(.c) void {
+        self.private().model.setSelected(0);
     }
 
     fn dispose(self: *Self) callconv(.c) void {
