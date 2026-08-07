@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
 const adw = @import("adw");
+const gdk = @import("gdk");
 const gio = @import("gio");
 const glib = @import("glib");
 const gobject = @import("gobject");
@@ -43,6 +44,16 @@ pub fn splitProjectTitle(title: []const u8) struct { ?[]const u8, []const u8 } {
     if (project.len == 0 or name.len == 0) return .{ null, title };
 
     return .{ project, name };
+}
+
+/// Replace the home directory prefix with "~" for display, matching what the
+/// macOS palette does for its own entries.
+fn abbreviateHome(alloc: Allocator, path: []const u8) ?[:0]const u8 {
+    const home = std.mem.span(glib.getHomeDir());
+    if (home.len > 0 and std.mem.startsWith(u8, path, home)) {
+        return std.fmt.allocPrintSentinel(alloc, "~{s}", .{path[home.len..]}, 0) catch null;
+    }
+    return alloc.dupeZ(u8, path) catch null;
 }
 
 pub const CommandPalette = extern struct {
@@ -171,6 +182,42 @@ pub const CommandPalette = extern struct {
             self,
             .{},
         );
+
+        // Ctrl+Enter creates an unnamed terminal. This is deliberately a key
+        // controller rather than a row: it has to work with an empty query,
+        // when there is no create row to select.
+        const keys = gtk.EventControllerKey.new();
+        _ = gtk.EventControllerKey.signals.key_pressed.connect(
+            keys,
+            *Self,
+            keyPressed,
+            self,
+            .{},
+        );
+        self.private().search.as(gtk.Widget).addController(keys.as(gtk.EventController));
+    }
+
+    fn keyPressed(
+        _: *gtk.EventControllerKey,
+        keyval: c_uint,
+        _: c_uint,
+        state: gdk.ModifierType,
+        self: *Self,
+    ) callconv(.c) c_int {
+        const is_return = keyval == gdk.KEY_Return or
+            keyval == gdk.KEY_KP_Enter or
+            keyval == gdk.KEY_ISO_Enter;
+        if (!is_return or !state.control_mask) return 0;
+
+        const priv = self.private();
+        if (priv.mode != .jump) return 0;
+
+        const window = priv.window.get() orelse return 0;
+        defer window.unref();
+
+        self.close();
+        window.newTabUntitled();
+        return 1;
     }
 
     /// Move the selection back to the first row.
@@ -463,7 +510,12 @@ pub const CommandPalette = extern struct {
         const query = std.mem.trim(u8, text, " ");
         if (query.len == 0) return;
 
-        const cmd = Command.newCreate(config, query) catch |err| {
+        const cwd = if (priv.window.get()) |window| cwd: {
+            defer window.unref();
+            break :cwd window.newTabCwdFor(query);
+        } else null;
+
+        const cmd = Command.newCreate(config, query, cwd) catch |err| {
             log.warn("failed to create the create-terminal row: {}", .{err});
             return;
         };
@@ -809,6 +861,11 @@ const Command = extern struct {
 
             /// The row label, e.g. `Create tab "web:server"`.
             title: ?[:0]const u8 = null,
+
+            /// The directory the new terminal will start in, for display, so
+            /// that the project inheritance rule is visible rather than a
+            /// surprise.
+            subtitle: ?[:0]const u8 = null,
         };
 
         pub const RegularData = struct {
@@ -859,13 +916,19 @@ const Command = extern struct {
 
     /// Create the synthetic row that offers to create a terminal named
     /// after the current query.
-    pub fn newCreate(config: *Config, query: []const u8) Allocator.Error!*Self {
+    pub fn newCreate(
+        config: *Config,
+        query: []const u8,
+        cwd: ?[]const u8,
+    ) Allocator.Error!*Self {
         const self = gobject.ext.newInstance(Self, .{ .config = config });
         errdefer self.unref();
 
         const priv = self.private();
+        const alloc = priv.arena.allocator();
         priv.data = .{ .create = .{
-            .query = try priv.arena.allocator().dupeZ(u8, query),
+            .query = try alloc.dupeZ(u8, query),
+            .subtitle = if (cwd) |v| abbreviateHome(alloc, v) else null,
         } };
 
         return self;
@@ -1057,7 +1120,7 @@ const Command = extern struct {
 
         switch (priv.data) {
             .regular => return self.propGetActionKey(),
-            .create => return null,
+            .create => |*c| return c.subtitle,
             .jump => |*j| {
                 if (j.subtitle) |v| return v;
 
@@ -1065,22 +1128,7 @@ const Command = extern struct {
                 defer surface.unref();
 
                 const pwd = surface.getPwd() orelse return null;
-                const alloc = priv.arena.allocator();
-
-                // Abbreviate the home directory to "~", matching what macOS
-                // already does for its own jump entries.
-                const home = std.mem.span(glib.getHomeDir());
-                if (home.len > 0 and std.mem.startsWith(u8, pwd, home)) {
-                    j.subtitle = std.fmt.allocPrintSentinel(
-                        alloc,
-                        "~{s}",
-                        .{pwd[home.len..]},
-                        0,
-                    ) catch null;
-                } else {
-                    j.subtitle = alloc.dupeZ(u8, pwd) catch null;
-                }
-
+                j.subtitle = abbreviateHome(priv.arena.allocator(), pwd);
                 return j.subtitle;
             },
         }

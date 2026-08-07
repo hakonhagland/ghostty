@@ -432,38 +432,56 @@ pub const Window = extern struct {
     /// already belongs to, the new tab starts in that project's most recently
     /// used working directory. Otherwise it inherits from the active surface
     /// as a new tab normally would.
+    /// The working directory that a tab named `title` would inherit from its
+    /// project, or null if the title names no project or no tab belongs to it.
+    ///
+    /// Split out from `newTabTitled` so that the session search can show the
+    /// directory a new terminal will start in before you commit to creating it.
+    pub fn projectCwd(title: []const u8) ?[:0]const u8 {
+        const project = splitProjectTitle(title)[0] orelse return null;
+
+        // Look across every window, matching what the palette lists.
+        var best: ?*Surface = null;
+        var best_seq: u64 = 0;
+        for (Application.default().core().surfaces.items) |rt_surface| {
+            const surface = rt_surface.gobj();
+
+            const tab = ext.getAncestor(
+                Tab,
+                surface.as(gtk.Widget),
+            ) orelse continue;
+
+            const other = tab.getTitleOverride() orelse continue;
+            const other_project = splitProjectTitle(other)[0] orelse continue;
+            if (!std.mem.eql(u8, other_project, project)) continue;
+
+            const seq = surface.getFocusSeq();
+            if (best == null or seq > best_seq) {
+                best = surface;
+                best_seq = seq;
+            }
+        }
+
+        return (best orelse return null).getPwd();
+    }
+
+    /// The directory a new tab named `title` would actually start in: the
+    /// project's directory if there is one, otherwise whatever it would
+    /// inherit from the terminal we are in right now.
+    pub fn newTabCwdFor(self: *Self, title: []const u8) ?[:0]const u8 {
+        if (projectCwd(title)) |cwd| return cwd;
+        const surface = self.getActiveSurface() orelse return null;
+        return surface.getPwd();
+    }
+
+    /// Create a new tab with no manually set title, as `new_tab` would.
+    pub fn newTabUntitled(self: *Self) void {
+        self.newTab(if (self.getActiveSurface()) |v| v.core() else null);
+    }
+
     pub fn newTabTitled(self: *Self, title: [:0]const u8) void {
         const parent = if (self.getActiveSurface()) |v| v.core() else null;
-
-        const cwd: ?[:0]const u8 = cwd: {
-            const project = splitProjectTitle(title)[0] orelse
-                break :cwd null;
-
-            // Look across every window, matching what the palette lists.
-            var best: ?*Surface = null;
-            var best_seq: u64 = 0;
-            for (Application.default().core().surfaces.items) |rt_surface| {
-                const surface = rt_surface.gobj();
-
-                const tab = ext.getAncestor(
-                    Tab,
-                    surface.as(gtk.Widget),
-                ) orelse continue;
-
-                const other = tab.getTitleOverride() orelse continue;
-                const other_project = splitProjectTitle(other)[0] orelse
-                    continue;
-                if (!std.mem.eql(u8, other_project, project)) continue;
-
-                const seq = surface.getFocusSeq();
-                if (best == null or seq > best_seq) {
-                    best = surface;
-                    best_seq = seq;
-                }
-            }
-
-            break :cwd (best orelse break :cwd null).getPwd();
-        };
+        const cwd = projectCwd(title);
 
         const page = self.newTabPage(parent, .tab, .{ .working_directory = cwd });
         const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
