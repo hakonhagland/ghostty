@@ -204,20 +204,52 @@ pub const CommandPalette = extern struct {
         state: gdk.ModifierType,
         self: *Self,
     ) callconv(.c) c_int {
-        const is_return = keyval == gdk.KEY_Return or
-            keyval == gdk.KEY_KP_Enter or
-            keyval == gdk.KEY_ISO_Enter;
-        if (!is_return or !state.control_mask) return 0;
+        if (!state.control_mask) return 0;
 
         const priv = self.private();
         if (priv.mode != .jump) return 0;
 
-        const window = priv.window.get() orelse return 0;
-        defer window.unref();
+        const is_return = keyval == gdk.KEY_Return or
+            keyval == gdk.KEY_KP_Enter or
+            keyval == gdk.KEY_ISO_Enter;
 
-        self.close();
-        window.newTabUntitled();
-        return 1;
+        if (is_return) {
+            const window = priv.window.get() orelse return 0;
+            defer window.unref();
+
+            self.close();
+            window.newTabUntitled();
+            return 1;
+        }
+
+        if (keyval == gdk.KEY_r or keyval == gdk.KEY_R) {
+            const tab = self.selectedTab() orelse return 0;
+
+            // Close first: an AdwDialog opened over another one leaves the
+            // palette not properly closed and unable to take focus when it is
+            // next opened. `activated` closes for the same reason.
+            self.close();
+            tab.promptTabTitle();
+            return 1;
+        }
+
+        return 0;
+    }
+
+    /// The tab owning the currently selected row, if that row is a terminal.
+    fn selectedTab(self: *Self) ?*Tab {
+        const priv = self.private();
+
+        const object = priv.model.as(gio.ListModel).getObject(
+            priv.model.getSelected(),
+        ) orelse return null;
+        defer object.unref();
+
+        const cmd = gobject.ext.cast(Command, object) orelse return null;
+        const surface = cmd.getJumpSurface() orelse return null;
+        defer surface.unref();
+
+        return ext.getAncestor(Tab, surface.as(gtk.Widget));
     }
 
     /// Move the selection back to the first row.
