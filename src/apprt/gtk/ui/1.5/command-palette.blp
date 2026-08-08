@@ -8,6 +8,24 @@ Adw.Dialog dialog {
 
   Adw.ToolbarView {
     top-bar-style: flat;
+    bottom-bar-style: flat;
+
+    [bottom]
+    Gtk.Label hints {
+      visible: false;
+      xalign: 0;
+      margin-start: 12;
+      margin-end: 12;
+      margin-top: 6;
+      margin-bottom: 6;
+      ellipsize: end;
+      single-line-mode: true;
+
+      styles [
+        "caption",
+        "dim-label",
+      ]
+    }
 
     [top]
     Adw.HeaderBar {

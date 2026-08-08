@@ -132,6 +132,15 @@ pub const CommandPalette = extern struct {
         /// This is where all command data is ultimately stored.
         source: *gio.ListStore,
 
+        /// The footer listing the session search shortcuts.
+        hints: *gtk.Label,
+
+        /// The tab whose rename we are waiting on, and the handler watching
+        /// it. The tab outlives the palette, so this must be disconnected in
+        /// dispose or the callback would run against freed memory.
+        rename_tab: WeakRef(Tab) = .empty,
+        rename_handler: c_ulong = 0,
+
         /// The synthetic "create a terminal" row, when the query is non-empty
         /// in jump mode. Kept here so it can be replaced as the query changes.
         create_cmd: ?*Command = null,
@@ -183,10 +192,11 @@ pub const CommandPalette = extern struct {
             .{},
         );
 
-        // Ctrl+Enter creates an unnamed terminal. This is deliberately a key
-        // controller rather than a row: it has to work with an empty query,
-        // when there is no create row to select.
+        // Shortcuts for the session search. This is on the dialog in the
+        // capture phase rather than on the entry so that it still works once
+        // focus has moved into the result list.
         const keys = gtk.EventControllerKey.new();
+        keys.as(gtk.EventController).setPropagationPhase(.capture);
         _ = gtk.EventControllerKey.signals.key_pressed.connect(
             keys,
             *Self,
@@ -194,7 +204,7 @@ pub const CommandPalette = extern struct {
             self,
             .{},
         );
-        self.private().search.as(gtk.Widget).addController(keys.as(gtk.EventController));
+        self.private().dialog.as(gtk.Widget).addController(keys.as(gtk.EventController));
     }
 
     fn keyPressed(
@@ -204,10 +214,22 @@ pub const CommandPalette = extern struct {
         state: gdk.ModifierType,
         self: *Self,
     ) callconv(.c) c_int {
-        if (!state.control_mask) return 0;
-
         const priv = self.private();
         if (priv.mode != .jump) return 0;
+
+        // Up from the first row returns to the search entry. Without this the
+        // only way back to the query after arrowing into the list is the
+        // mouse, which breaks an otherwise keyboard-only flow.
+        if (keyval == gdk.KEY_Up or keyval == gdk.KEY_KP_Up) {
+            if (state.control_mask) return 0;
+            const search = priv.search.as(gtk.Widget);
+            if (search.hasFocus() != 0) return 0;
+            if (priv.model.getSelected() != 0) return 0;
+            _ = search.grabFocus();
+            return 1;
+        }
+
+        if (!state.control_mask) return 0;
 
         const is_return = keyval == gdk.KEY_Return or
             keyval == gdk.KEY_KP_Enter or
@@ -225,15 +247,69 @@ pub const CommandPalette = extern struct {
         if (keyval == gdk.KEY_r or keyval == gdk.KEY_R) {
             const tab = self.selectedTab() orelse return 0;
 
-            // Close first: an AdwDialog opened over another one leaves the
-            // palette not properly closed and unable to take focus when it is
-            // next opened. `activated` closes for the same reason.
-            self.close();
+            // Watch for the rename landing so the row can be rebuilt under
+            // the user. Without this the list keeps showing the old name
+            // while the tab bar shows the new one.
+            self.disconnectRename();
+            priv.rename_handler = gobject.Object.signals.notify.connect(
+                tab,
+                *Self,
+                tabRenamed,
+                self,
+                .{ .detail = "title-override" },
+            );
+            priv.rename_tab.set(tab);
+
+            // Deliberately does *not* close the palette. Renaming is something
+            // you discover you need part way through switching, so you should
+            // land back in the list afterwards and be able to carry on with
+            // what you originally opened it for.
             tab.promptTabTitle();
             return 1;
         }
 
         return 0;
+    }
+
+    fn tabRenamed(tab: *Tab, _: *gobject.ParamSpec, self: *Self) callconv(.c) void {
+        const priv = self.private();
+        defer self.disconnectRename();
+
+        // Re-render just the affected rows rather than rebuilding the list.
+        // A rebuild would re-sort, and since the rename dialog has taken the
+        // focus away the recency order comes back different, so the row the
+        // user is looking at would jump somewhere else mid-task.
+        const n = priv.source.as(gio.ListModel).getNItems();
+        var i: c_uint = 0;
+        while (i < n) : (i += 1) {
+            const object = priv.source.as(gio.ListModel).getObject(i) orelse continue;
+            defer object.unref();
+
+            const cmd = gobject.ext.cast(Command, object) orelse continue;
+            const surface = cmd.getJumpSurface() orelse continue;
+            defer surface.unref();
+
+            const owner = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse continue;
+            if (owner != tab) continue;
+
+            cmd.invalidateTitle();
+        }
+    }
+
+    fn disconnectRename(self: *Self) void {
+        const priv = self.private();
+        if (priv.rename_handler == 0) return;
+
+        if (priv.rename_tab.get()) |tab| {
+            defer tab.unref();
+            gobject.signalHandlerDisconnect(
+                tab.as(gobject.Object),
+                priv.rename_handler,
+            );
+        }
+
+        priv.rename_handler = 0;
+        priv.rename_tab.set(null);
     }
 
     /// The tab owning the currently selected row, if that row is a terminal.
@@ -276,7 +352,13 @@ pub const CommandPalette = extern struct {
         // a lock inside each entry — so if this object's memory has been freed
         // by then, the target locks whatever now occupies it and can block
         // forever. `inspector_window.zig` carries the same warning.
+        //
+        // disconnectRename clears rename_tab too, but only when a handler is
+        // connected. Clearing it here as well costs nothing and removes the
+        // dependence on that pairing holding forever.
+        self.disconnectRename();
         priv.window.set(null);
+        priv.rename_tab.set(null);
         priv.source.removeAll();
 
         if (priv.config) |config| {
@@ -305,7 +387,10 @@ pub const CommandPalette = extern struct {
         const priv = self.private();
         if (priv.mode == mode) return;
         priv.mode = mode;
-        if (priv.config != null) self.refresh();
+        if (priv.config != null) {
+            priv.search.as(gtk.Editable).setText("");
+            self.refresh();
+        }
     }
 
     fn propConfig(self: *CommandPalette, _: *gobject.ParamSpec, _: ?*anyopaque) callconv(.c) void {
@@ -321,11 +406,18 @@ pub const CommandPalette = extern struct {
         };
 
         // The placeholder tells the user what this invocation will search.
-        priv.search.as(gtk.Editable).setText("");
         priv.search.setPlaceholderText(switch (priv.mode) {
             .all => i18n._("Execute a command…"),
             .jump => i18n._("Switch to a terminal…"),
         });
+
+        // The session search has shortcuts that nothing else advertises, so
+        // spell them out. The plain palette has none, so it gets no footer.
+        const show_hints = priv.mode == .jump;
+        priv.hints.as(gtk.Widget).setVisible(@intFromBool(show_hints));
+        if (show_hints) priv.hints.setLabel(
+            i18n._("Enter switch · Ctrl+Enter new terminal · Ctrl+R rename"),
+        );
 
         // Clear existing binds
         priv.source.removeAll();
@@ -362,7 +454,7 @@ pub const CommandPalette = extern struct {
         // This is a post-sort fixup rather than a rule in the comparator
         // because "the focused entry sorts second" is not a strict weak
         // ordering, and an ill-formed comparator is not safe to hand to sort.
-        if (commands.items.len >= 2) demote: {
+        if (priv.mode == .jump and commands.items.len >= 2) demote: {
             const first = commands.items[0];
             if (!first.isJump()) break :demote;
             if (!commands.items[1].isJump()) break :demote;
@@ -430,7 +522,7 @@ pub const CommandPalette = extern struct {
         config: *Config,
         commands: *std.ArrayList(*Command),
     ) !void {
-        _ = self;
+        const plain = self.private().mode == .all;
         const app = Application.default();
         const alloc = app.allocator();
 
@@ -438,7 +530,7 @@ pub const CommandPalette = extern struct {
         const core_app = app.core();
         for (core_app.surfaces.items) |apprt_surface| {
             const surface = apprt_surface.gobj();
-            const cmd = Command.newJump(config, surface);
+            const cmd = Command.newJump(config, surface, plain);
             errdefer cmd.unref();
             try commands.append(alloc, cmd);
         }
@@ -454,23 +546,30 @@ pub const CommandPalette = extern struct {
     /// Regular commands sort alphabetically by title (case-insensitive), with
     /// colon normalization so "Foo:" sorts before "Foo Bar:".
     fn compareCommands(a: *Command, b: *Command) bool {
-        // Jump commands first, most recently used first amongst themselves.
         // The synthetic create row always sorts last so that it never steals
         // the default selection from a real terminal.
+        if (a.isCreate()) return false;
+        if (b.isCreate()) return true;
+
+        // In the session search, terminals sort most recently used first.
+        // In the plain palette they keep upstream's behaviour and interleave
+        // alphabetically with the configured commands, below.
         switch (a.private().data) {
-            .create => return false,
             .jump => |*ja| switch (b.private().data) {
                 .jump => |*jb| {
-                    if (ja.sort_key == jb.sort_key) return false;
-                    return ja.sort_key > jb.sort_key;
+                    if (!ja.plain and !jb.plain) {
+                        if (ja.sort_key == jb.sort_key) return false;
+                        return ja.sort_key > jb.sort_key;
+                    }
                 },
-                .regular, .create => return true,
+                .regular => if (!ja.plain) return true,
+                .create => unreachable,
             },
             .regular => switch (b.private().data) {
-                .jump => return false,
-                .create => return true,
-                .regular => {},
+                .jump => |*jb| if (!jb.plain) return false,
+                .regular, .create => {},
             },
+            .create => unreachable,
         }
 
         const a_title = a.propGetTitle() orelse return false;
@@ -592,6 +691,19 @@ pub const CommandPalette = extern struct {
 
         // Focus on the search bar when opening the dialog
         _ = priv.search.as(gtk.Widget).grabFocus();
+
+        // If the pointer happens to be resting over the list as it appears,
+        // hover selects that row (see `resetSelection`). That happens as the
+        // list is mapped, which is after this point, so the correction has to
+        // wait for the main loop to settle.
+        _ = glib.idleAddOnce(idleResetSelection, self.ref());
+    }
+
+    /// Userdata is a `*CommandPalette`. Unrefs once.
+    fn idleResetSelection(ud: ?*anyopaque) callconv(.c) void {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return));
+        defer self.unref();
+        self.private().model.setSelected(0);
     }
 
     /// Helper function to send a signal containing the action that should be
@@ -670,6 +782,7 @@ pub const CommandPalette = extern struct {
             class.bindTemplateChildPrivate("view", .{});
             class.bindTemplateChildPrivate("model", .{});
             class.bindTemplateChildPrivate("source", .{});
+            class.bindTemplateChildPrivate("hints", .{});
 
             // Template Callbacks
             class.bindTemplateCallback("closed", &dialogClosed);
@@ -925,6 +1038,11 @@ const Command = extern struct {
             /// read live so that the ordering cannot shift underneath the
             /// user while the palette is open.
             sort_key: u64,
+
+            /// True when this entry is being shown in the plain command
+            /// palette, where it behaves exactly as it did before the session
+            /// search existed: a "Focus: " prefix and no project split.
+            plain: bool = false,
         };
     };
 
@@ -967,14 +1085,17 @@ const Command = extern struct {
     }
 
     /// Create a new jump command that focuses a specific surface.
-    pub fn newJump(config: *Config, surface: *Surface) *Self {
+    pub fn newJump(config: *Config, surface: *Surface, plain: bool) *Self {
         const self = gobject.ext.newInstance(Self, .{
             .config = config,
         });
 
         const priv = self.private();
         priv.data = .{
-            .jump = .{ .sort_key = surface.getFocusSeq() },
+            .jump = .{
+                .sort_key = surface.getFocusSeq(),
+                .plain = plain,
+            },
         };
         priv.data.jump.surface.set(surface);
 
@@ -1090,6 +1211,21 @@ const Command = extern struct {
             break :tab tab.getTitleOverride();
         };
 
+        const effective_title = surface.getEffectiveTitle() orelse "Untitled";
+
+        // In the plain palette these entries sit amongst the configured
+        // commands, so they keep the prefix that tells them apart, and the
+        // project convention does not apply.
+        if (j.plain) {
+            j.title = std.fmt.allocPrintSentinel(
+                alloc,
+                "Focus: {s}",
+                .{effective_title},
+                0,
+            ) catch null;
+            return;
+        }
+
         if (override) |title| {
             const project, const name = splitProjectTitle(title);
             if (project) |p| j.project = alloc.dupeZ(u8, p) catch null;
@@ -1097,7 +1233,6 @@ const Command = extern struct {
             return;
         }
 
-        const effective_title = surface.getEffectiveTitle() orelse "Untitled";
         j.title = alloc.dupeZ(u8, effective_title) catch null;
     }
 
@@ -1216,6 +1351,27 @@ const Command = extern struct {
     pub fn isCreate(self: *Self) bool {
         const priv = self.private();
         return priv.data == .create;
+    }
+
+    /// Drop the cached title/project so they are recomputed on next read.
+    ///
+    /// The old strings stay in the arena until this command dies. That is
+    /// fine: commands live for one showing of the palette, and a rename is
+    /// rare enough that the waste is a few dozen bytes.
+    pub fn invalidateTitle(self: *Self) void {
+        const priv = self.private();
+        switch (priv.data) {
+            .regular, .create => return,
+            .jump => |*j| {
+                j.title = null;
+                j.project = null;
+                j.parsed = false;
+            },
+        }
+
+        self.as(gobject.Object).notifyByPspec(properties.title.impl.param_spec);
+        self.as(gobject.Object).notifyByPspec(properties.project.impl.param_spec);
+        self.as(gobject.Object).notifyByPspec(properties.@"has-project".impl.param_spec);
     }
 
     /// The text the user had typed when this create row was built.
