@@ -217,19 +217,41 @@ pub const CommandPalette = extern struct {
         const priv = self.private();
         if (priv.mode != .jump) return 0;
 
-        // Up from the first row returns to the search entry. Without this the
-        // only way back to the query after arrowing into the list is the
-        // mouse, which breaks an otherwise keyboard-only flow.
-        if (keyval == gdk.KEY_Up or keyval == gdk.KEY_KP_Up) {
-            if (state.control_mask) return 0;
-            const search = priv.search.as(gtk.Widget);
-            if (search.hasFocus() != 0) return 0;
-            if (priv.model.getSelected() != 0) return 0;
-            _ = search.grabFocus();
+        // Drive the selection ourselves rather than letting GTK move focus
+        // into the list.
+        //
+        // Left to itself, the first Down moves *focus* from the entry into the
+        // list without moving the selection, so it appears to do nothing and
+        // the second press is the one that moves. Hover makes it worse, since
+        // it moves the selection independently, so the focus ring and the
+        // highlight end up on different rows.
+        //
+        // Keeping focus in the entry the whole time means one press always
+        // moves one row, from wherever the selection currently is, and typing
+        // never stops working. This is how quick-open pickers generally
+        // behave.
+        if (!state.control_mask) {
+            const down = keyval == gdk.KEY_Down or keyval == gdk.KEY_KP_Down;
+            const up = keyval == gdk.KEY_Up or keyval == gdk.KEY_KP_Up;
+            if (!down and !up) return 0;
+
+            const n = priv.model.as(gio.ListModel).getNItems();
+            if (n == 0) return 1;
+
+            const current = priv.model.getSelected();
+
+            // An unset selection counts as "before the first row", so the
+            // first Down lands on the top row rather than the second.
+            const next: c_uint = if (current == gtk.INVALID_LIST_POSITION)
+                0
+            else if (down)
+                @min(current + 1, n - 1)
+            else if (current == 0) 0 else current - 1;
+
+            priv.model.setSelected(next);
+            priv.view.scrollTo(next, .{}, null);
             return 1;
         }
-
-        if (!state.control_mask) return 0;
 
         const is_return = keyval == gdk.KEY_Return or
             keyval == gdk.KEY_KP_Enter or
