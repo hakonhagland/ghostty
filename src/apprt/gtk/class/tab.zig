@@ -127,6 +127,21 @@ pub const Tab = extern struct {
                 },
             );
         };
+        /// The project this tab belongs to, if any. Purely a user-assigned
+        /// label; nothing derives it.
+        pub const project = struct {
+            pub const name = "project";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = C.privateStringFieldAccessor("project"),
+                },
+            );
+        };
+
         pub const @"title-override" = struct {
             pub const name = "title-override";
             const impl = gobject.ext.defineProperty(
@@ -164,6 +179,10 @@ pub const Tab = extern struct {
 
         /// The manually overridden title.
         title_override: ?[:0]const u8 = null,
+
+        /// The project this tab belongs to, from `promptTabProject` or from
+        /// the `project:name` shorthand accepted by the title dialog.
+        project: ?[:0]const u8 = null,
 
         /// The tooltip of this tab. This is usually bound to the active surface.
         tooltip: ?[:0]const u8 = null,
@@ -245,6 +264,7 @@ pub const Tab = extern struct {
             .init("next-page", actionNextPage, null),
             .init("previous-page", actionPreviousPage, null),
             .init("prompt-tab-title", actionPromptTabTitle, null),
+            .init("prompt-tab-project", actionPromptTabProject, null),
         };
 
         _ = ext.actions.addAsGroup(Self, self, "tab", &actions);
@@ -261,6 +281,21 @@ pub const Tab = extern struct {
         return self.private().title_override;
     }
 
+    /// The project this tab belongs to, if the user has assigned one.
+    pub fn getProject(self: *Self) ?[:0]const u8 {
+        return self.private().project;
+    }
+
+    pub fn setProject(self: *Self, project: ?[:0]const u8) void {
+        const priv = self.private();
+        if (priv.project) |v| glib.free(@ptrCast(@constCast(v)));
+        priv.project = null;
+        if (project) |v| {
+            if (v.len > 0) priv.project = glib.ext.dupeZ(u8, v);
+        }
+        self.as(gobject.Object).notifyByPspec(properties.project.impl.param_spec);
+    }
+
     pub fn setTitleOverride(self: *Self, title: ?[:0]const u8) void {
         const priv = self.private();
         if (priv.title_override) |v| glib.free(@ptrCast(@constCast(v)));
@@ -273,8 +308,60 @@ pub const Tab = extern struct {
         title_ptr: [*:0]const u8,
         self: *Self,
     ) callconv(.c) void {
-        const title = std.mem.span(title_ptr);
-        self.setTitleOverride(if (title.len == 0) null else title);
+        const typed = std.mem.span(title_ptr);
+        if (typed.len == 0) {
+            self.setTitleOverride(null);
+            return;
+        }
+
+        // "project:name" is accepted as shorthand so that a project can be
+        // assigned without a second trip through the dialog. Only what the
+        // user typed here is ever split this way; the terminal-reported title
+        // is not, because colons are common in it.
+        if (std.mem.indexOfScalar(u8, typed, ':')) |idx| {
+            const project = std.mem.trim(u8, typed[0..idx], " ");
+            const name = std.mem.trim(u8, typed[idx + 1 ..], " ");
+            if (project.len > 0) {
+                // Allocate a sentinel copy; the incoming slice is borrowed.
+                const alloc = Application.default().allocator();
+                if (alloc.dupeZ(u8, project)) |p| {
+                    defer alloc.free(p);
+                    self.setProject(p);
+                } else |_| {}
+
+                if (name.len == 0) {
+                    self.setTitleOverride(null);
+                } else if (alloc.dupeZ(u8, name)) |t| {
+                    defer alloc.free(t);
+                    self.setTitleOverride(t);
+                } else |_| {}
+                return;
+            }
+        }
+
+        self.setTitleOverride(typed);
+    }
+
+    fn projectDialogSet(
+        _: *TitleDialog,
+        project_ptr: [*:0]const u8,
+        self: *Self,
+    ) callconv(.c) void {
+        const project = std.mem.span(project_ptr);
+        self.setProject(if (project.len == 0) null else project);
+    }
+
+    pub fn promptTabProject(self: *Self) void {
+        const dialog = TitleDialog.new(.project, self.private().project);
+        _ = TitleDialog.signals.set.connect(
+            dialog,
+            *Self,
+            projectDialogSet,
+            self,
+            .{},
+        );
+
+        dialog.present(self.as(gtk.Widget));
     }
     pub fn promptTabTitle(self: *Self) void {
         const priv = self.private();
@@ -360,6 +447,10 @@ pub const Tab = extern struct {
             glib.free(@ptrCast(@constCast(v)));
             priv.title = null;
         }
+        if (priv.project) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.project = null;
+        }
         if (priv.title_override) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.title_override = null;
@@ -438,6 +529,14 @@ pub const Tab = extern struct {
             .other => tab_view.closeOtherPages(page),
             .right => tab_view.closePagesAfter(page),
         }
+    }
+
+    fn actionPromptTabProject(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        self.promptTabProject();
     }
 
     fn actionPromptTabTitle(
@@ -573,6 +672,7 @@ pub const Tab = extern struct {
                 properties.@"split-tree".impl,
                 properties.@"surface-tree".impl,
                 properties.title.impl,
+                properties.project.impl,
                 properties.@"title-override".impl,
                 properties.tooltip.impl,
             });

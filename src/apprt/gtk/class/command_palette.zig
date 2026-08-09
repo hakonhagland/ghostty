@@ -24,28 +24,6 @@ const Config = @import("config.zig").Config;
 
 const log = std.log.scoped(.gtk_ghostty_command_palette);
 
-/// Split a manually set tab title into its project and name parts.
-///
-/// A tab title of "web:server" means project "web", name "server". A title
-/// with no colon has no project.
-///
-/// This is only ever applied to a title the user typed themselves. The
-/// terminal-reported title must never be split, because colons are common in
-/// it: the shell integration reports the running command, so "ssh host:port"
-/// or "docker run img:tag" would otherwise be torn in half.
-pub fn splitProjectTitle(title: []const u8) struct { ?[]const u8, []const u8 } {
-    const idx = std.mem.indexOfScalar(u8, title, ':') orelse
-        return .{ null, title };
-
-    const project = std.mem.trim(u8, title[0..idx], " ");
-    const name = std.mem.trim(u8, title[idx + 1 ..], " ");
-
-    // A leading or trailing colon is not a project, it's just a title.
-    if (project.len == 0 or name.len == 0) return .{ null, title };
-
-    return .{ project, name };
-}
-
 /// Replace the home directory prefix with "~" for display, matching what the
 /// macOS palette does for its own entries.
 fn abbreviateHome(alloc: Allocator, path: []const u8) ?[:0]const u8 {
@@ -266,21 +244,17 @@ pub const CommandPalette = extern struct {
             return 1;
         }
 
+        if (keyval == gdk.KEY_p or keyval == gdk.KEY_P) {
+            const tab = self.selectedTab() orelse return 0;
+            self.watchRename(tab);
+            tab.promptTabProject();
+            return 1;
+        }
+
         if (keyval == gdk.KEY_r or keyval == gdk.KEY_R) {
             const tab = self.selectedTab() orelse return 0;
 
-            // Watch for the rename landing so the row can be rebuilt under
-            // the user. Without this the list keeps showing the old name
-            // while the tab bar shows the new one.
-            self.disconnectRename();
-            priv.rename_handler = gobject.Object.signals.notify.connect(
-                tab,
-                *Self,
-                tabRenamed,
-                self,
-                .{ .detail = "title-override" },
-            );
-            priv.rename_tab.set(tab);
+            self.watchRename(tab);
 
             // Deliberately does *not* close the palette. Renaming is something
             // you discover you need part way through switching, so you should
@@ -291,6 +265,21 @@ pub const CommandPalette = extern struct {
         }
 
         return 0;
+    }
+
+    /// Watch a tab for its title or project changing, so the row can be
+    /// re-rendered under the user while the palette stays open.
+    fn watchRename(self: *Self, tab: *Tab) void {
+        const priv = self.private();
+        self.disconnectRename();
+        priv.rename_handler = gobject.Object.signals.notify.connect(
+            tab,
+            *Self,
+            tabRenamed,
+            self,
+            .{},
+        );
+        priv.rename_tab.set(tab);
     }
 
     fn tabRenamed(tab: *Tab, _: *gobject.ParamSpec, self: *Self) callconv(.c) void {
@@ -438,7 +427,7 @@ pub const CommandPalette = extern struct {
         const show_hints = priv.mode == .jump;
         priv.hints.as(gtk.Widget).setVisible(@intFromBool(show_hints));
         if (show_hints) priv.hints.setLabel(
-            i18n._("Enter switch · Ctrl+Enter new terminal · Ctrl+R rename"),
+            i18n._("Enter switch · Ctrl+Enter new · Ctrl+R rename · Ctrl+P project"),
         );
 
         // Clear existing binds
@@ -1225,13 +1214,11 @@ const Command = extern struct {
 
         // Only a manually set *tab* title participates in the project
         // convention. Fall back to the surface's effective title otherwise.
-        const override = tab: {
-            const tab = ext.getAncestor(
-                Tab,
-                surface.as(gtk.Widget),
-            ) orelse break :tab null;
-            break :tab tab.getTitleOverride();
-        };
+        const tab_ = ext.getAncestor(Tab, surface.as(gtk.Widget));
+        if (tab_) |tab| {
+            if (tab.getProject()) |p| j.project = alloc.dupeZ(u8, p) catch null;
+        }
+        const override = if (tab_) |tab| tab.getTitleOverride() else null;
 
         const effective_title = surface.getEffectiveTitle() orelse "Untitled";
 
@@ -1239,6 +1226,7 @@ const Command = extern struct {
         // commands, so they keep the prefix that tells them apart, and the
         // project convention does not apply.
         if (j.plain) {
+            j.project = null;
             j.title = std.fmt.allocPrintSentinel(
                 alloc,
                 "Focus: {s}",
@@ -1248,14 +1236,7 @@ const Command = extern struct {
             return;
         }
 
-        if (override) |title| {
-            const project, const name = splitProjectTitle(title);
-            if (project) |p| j.project = alloc.dupeZ(u8, p) catch null;
-            j.title = alloc.dupeZ(u8, name) catch null;
-            return;
-        }
-
-        j.title = alloc.dupeZ(u8, effective_title) catch null;
+        j.title = alloc.dupeZ(u8, override orelse effective_title) catch null;
     }
 
     fn propGetTitle(self: *Self) ?[:0]const u8 {

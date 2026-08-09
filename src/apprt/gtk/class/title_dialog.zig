@@ -116,6 +116,7 @@ pub const TitleDialog = extern struct {
 
         // Set the title for the dialog
         self.as(Dialog.Parent).setHeading(priv.target.title());
+        self.as(Dialog.Parent).setBody(priv.target.body());
 
         // Show it. We could also just use virtual methods to bind to
         // response but this is pretty simple.
@@ -221,12 +222,23 @@ pub const Target = enum(c_int) {
     surface,
     tab,
     window,
+    project,
 
     pub fn title(self: Target) [*:0]const u8 {
         return switch (self) {
             .surface => i18n._("Change Terminal Title"),
             .tab => i18n._("Change Tab Title"),
             .window => i18n._("Change Window Title"),
+            .project => i18n._("Change Tab Project"),
+        };
+    }
+
+    /// The explanatory line under the heading. Blank always means "unset",
+    /// but what that restores differs.
+    pub fn body(self: Target) [*:0]const u8 {
+        return switch (self) {
+            .surface, .tab, .window => i18n._("Leave blank to restore the default title."),
+            .project => i18n._("Leave blank to remove the project."),
         };
     }
 

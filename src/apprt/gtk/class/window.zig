@@ -28,7 +28,6 @@ const Surface = @import("surface.zig").Surface;
 const Tab = @import("tab.zig").Tab;
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
-const splitProjectTitle = @import("command_palette.zig").splitProjectTitle;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
 
@@ -437,8 +436,28 @@ pub const Window = extern struct {
     ///
     /// Split out from `newTabTitled` so that the session search can show the
     /// directory a new terminal will start in before you commit to creating it.
-    pub fn projectCwd(title: []const u8) ?[:0]const u8 {
-        const project = splitProjectTitle(title)[0] orelse return null;
+    /// Split text the user typed into the switcher into "project:name".
+    ///
+    /// Only ever applied to what the user typed, never to a terminal-reported
+    /// title, so the colons that appear in running commands are not a hazard.
+    /// A trailing colon means a project with no custom name.
+    fn splitTyped(typed: []const u8) struct { ?[]const u8, []const u8 } {
+        const idx = std.mem.indexOfScalar(u8, typed, ':') orelse
+            return .{ null, typed };
+        const project = std.mem.trim(u8, typed[0..idx], " ");
+        if (project.len == 0) return .{ null, typed };
+        return .{ project, std.mem.trim(u8, typed[idx + 1 ..], " ") };
+    }
+
+    /// The project of the tab we are currently in, if it has one.
+    fn currentProject(self: *Self) ?[:0]const u8 {
+        const surface = self.getActiveSurface() orelse return null;
+        const tab = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse return null;
+        return tab.getProject();
+    }
+
+    pub fn projectCwd(project: []const u8) ?[:0]const u8 {
+        if (project.len == 0) return null;
 
         // Look across every window, matching what the palette lists.
         var best: ?*Surface = null;
@@ -451,8 +470,7 @@ pub const Window = extern struct {
                 surface.as(gtk.Widget),
             ) orelse continue;
 
-            const other = tab.getTitleOverride() orelse continue;
-            const other_project = splitProjectTitle(other)[0] orelse continue;
+            const other_project = tab.getProject() orelse continue;
             if (!std.mem.eql(u8, other_project, project)) continue;
 
             const seq = surface.getFocusSeq();
@@ -468,24 +486,65 @@ pub const Window = extern struct {
     /// The directory a new tab named `title` would actually start in: the
     /// project's directory if there is one, otherwise whatever it would
     /// inherit from the terminal we are in right now.
-    pub fn newTabCwdFor(self: *Self, title: []const u8) ?[:0]const u8 {
-        if (projectCwd(title)) |cwd| return cwd;
+    pub fn newTabCwdFor(self: *Self, typed: []const u8) ?[:0]const u8 {
+        // An explicitly typed project wins; otherwise the new terminal joins
+        // the project of the one we are in, which is what makes creating a
+        // second terminal in the same project need no typing at all.
+        const project = splitTyped(typed)[0] orelse self.currentProject();
+        if (project) |p| {
+            if (projectCwd(p)) |cwd| return cwd;
+        }
+
         const surface = self.getActiveSurface() orelse return null;
         return surface.getPwd();
     }
 
-    /// Create a new tab with no manually set title, as `new_tab` would.
+    /// Create a new tab with no manually set title, but belonging to the same
+    /// project as the tab we are in.
+    ///
+    /// Inheriting the project is what makes "another terminal in this project"
+    /// require no typing, and it is why assigning a project to a brand new
+    /// project only has to be done once, on the first tab.
     pub fn newTabUntitled(self: *Self) void {
-        self.newTab(if (self.getActiveSurface()) |v| v.core() else null);
+        const parent = if (self.getActiveSurface()) |v| v.core() else null;
+        const project = self.currentProject();
+        const cwd = if (project) |p| projectCwd(p) else null;
+
+        const page = self.newTabPage(parent, .tab, .{ .working_directory = cwd });
+        if (project) |p| {
+            const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
+            tab.setProject(p);
+        }
     }
 
-    pub fn newTabTitled(self: *Self, title: [:0]const u8) void {
+    pub fn newTabTitled(self: *Self, typed: [:0]const u8) void {
         const parent = if (self.getActiveSurface()) |v| v.core() else null;
-        const cwd = projectCwd(title);
+
+        const typed_project, const name = splitTyped(typed);
+        const inherited = if (typed_project == null) self.currentProject() else null;
+
+        const alloc = Application.default().allocator();
+        const project: ?[:0]const u8 = project: {
+            if (inherited) |p| break :project p;
+            const p = typed_project orelse break :project null;
+            break :project alloc.dupeZ(u8, p) catch null;
+        };
+        defer if (typed_project != null) {
+            if (project) |p| alloc.free(p);
+        };
+
+        const cwd = if (project) |p| projectCwd(p) else null;
 
         const page = self.newTabPage(parent, .tab, .{ .working_directory = cwd });
         const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
-        tab.setTitleOverride(title);
+
+        if (project) |p| tab.setProject(p);
+        if (name.len > 0) {
+            if (alloc.dupeZ(u8, name)) |t| {
+                defer alloc.free(t);
+                tab.setTitleOverride(t);
+            } else |_| {}
+        }
     }
 
     pub fn newTabForWindow(
