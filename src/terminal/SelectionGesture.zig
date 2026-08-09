@@ -151,10 +151,30 @@ pub const Behavior = lib.Enum(lib.target, &.{
 /// drags by word. A triple-click selects and drags by line.
 pub const default_behaviors: [3]Behavior = .{ .cell, .word, .line };
 
-/// Distance from the top or bottom surface edge, in pixels, where dragging
-/// should request autoscroll. This preserves the historical 1px buffer used
-/// so fullscreen-edge drags can still trigger autoscroll.
-const autoscroll_buffer: f64 = 1;
+/// Smallest distance from the top or bottom surface edge, in pixels, where
+/// dragging should request autoscroll.
+///
+/// This is a floor, not the zone: the zone is one cell tall (see
+/// `autoscrollBuffer`). One pixel is kept as the floor so a caller that does
+/// not know its cell height still gets the historical behavior, and so
+/// fullscreen-edge drags can still trigger autoscroll.
+const autoscroll_buffer_min: f64 = 1;
+
+/// The autoscroll trigger zone at each edge, in pixels.
+///
+/// A one-pixel zone is close to unhittable, and worse, it is unhittable
+/// *asymmetrically*: the top edge can be overshot — the pointer keeps going
+/// into whatever is above the terminal, and every position past the edge still
+/// counts — while the bottom edge of a maximized window is the bottom edge of
+/// the screen, where the pointer stops. So the same one-pixel rule reads as
+/// "scrolling up works, scrolling down is broken".
+///
+/// One cell tall means the whole last row of text is the target, which scales
+/// with font size and DPI without any new configuration.
+fn autoscrollBuffer(geometry: Drag.Geometry) f64 {
+    const cell: f64 = @floatFromInt(geometry.cell_height);
+    return @max(cell, autoscroll_buffer_min);
+}
 
 pub const init: SelectionGesture = .{
     .left_click_pin = null,
@@ -328,6 +348,10 @@ pub const Drag = struct {
 
         /// The height of the rendered terminal surface in surface pixels.
         screen_height: u32,
+
+        /// The height of one terminal cell in surface pixels. Sizes the
+        /// autoscroll trigger zone; zero falls back to a one-pixel zone.
+        cell_height: u32 = 0,
     };
 };
 
@@ -370,9 +394,13 @@ pub fn drag(
     // Determine if we should autoscroll. If our drag position is above
     // the top, we go up. If its below the bottom we go down. Easy.
     const max_y: f64 = @floatFromInt(d.geometry.screen_height);
-    self.left_drag_autoscroll = if (d.ypos <= autoscroll_buffer)
+    const buffer = autoscrollBuffer(d.geometry);
+    // Both comparisons are inclusive. They were not: the top used `<=` and the
+    // bottom `>`, so a pointer resting exactly on `max_y - buffer` triggered at
+    // one edge and not the other.
+    self.left_drag_autoscroll = if (d.ypos <= buffer)
         .up
-    else if (d.ypos > max_y - autoscroll_buffer)
+    else if (d.ypos >= max_y - buffer)
         .down
     else
         .none;
@@ -953,6 +981,17 @@ fn testPress(t: *Terminal, x: u16, y: u32, time: ?std.Io.Timestamp) Press {
 }
 
 fn testDrag(t: *Terminal, x: u16, y: u32, xpos: f64, ypos: f64) Drag {
+    return testDragCell(t, x, y, xpos, ypos, 0);
+}
+
+fn testDragCell(
+    t: *Terminal,
+    x: u16,
+    y: u32,
+    xpos: f64,
+    ypos: f64,
+    cell_height: u32,
+) Drag {
     return .{
         .pin = t.screens.active.pages.pin(.{ .active = .{
             .x = x,
@@ -967,6 +1006,7 @@ fn testDrag(t: *Terminal, x: u16, y: u32, xpos: f64, ypos: f64) Drag {
             .cell_width = 10,
             .padding_left = 0,
             .screen_height = 100,
+            .cell_height = cell_height,
         },
     };
 }
@@ -1692,11 +1732,49 @@ test "SelectionGesture drag autoscroll edge boundaries" {
     _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 1.1));
     try testing.expectEqual(.none, gesture.left_drag_autoscroll);
 
+    // Inclusive at the bottom, as it already was at the top. This used to be
+    // exclusive, so a pointer resting exactly on the boundary triggered at one
+    // edge and not the other — and the bottom edge is the one you cannot
+    // overshoot when the window is maximized.
     _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 99));
+    try testing.expectEqual(.down, gesture.left_drag_autoscroll);
+
+    _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 98.9));
     try testing.expectEqual(.none, gesture.left_drag_autoscroll);
 
     _ = gesture.drag(&t, testDrag(&t, 2, 1, 20, 99.1));
     try testing.expectEqual(.down, gesture.left_drag_autoscroll);
+}
+
+test "SelectionGesture autoscroll zone is one cell tall" {
+    var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(testing.allocator);
+
+    var gesture: SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    var press_event = testPress(&t, 1, 1, std.Io.Timestamp.now(testing.io, .awake));
+    press_event.xpos = 10;
+    _ = try gesture.press(&t, press_event);
+
+    // 100px tall, 20px cells: the whole last row of text is the target, not a
+    // single pixel of it.
+    _ = gesture.drag(&t, testDragCell(&t, 2, 1, 20, 80, 20));
+    try testing.expectEqual(.down, gesture.left_drag_autoscroll);
+
+    _ = gesture.drag(&t, testDragCell(&t, 2, 1, 20, 79.9, 20));
+    try testing.expectEqual(.none, gesture.left_drag_autoscroll);
+
+    // And symmetrically at the top.
+    _ = gesture.drag(&t, testDragCell(&t, 2, 1, 20, 20, 20));
+    try testing.expectEqual(.up, gesture.left_drag_autoscroll);
+
+    _ = gesture.drag(&t, testDragCell(&t, 2, 1, 20, 20.1, 20));
+    try testing.expectEqual(.none, gesture.left_drag_autoscroll);
+
+    // A caller that does not report a cell height keeps the old 1px zone.
+    _ = gesture.drag(&t, testDragCell(&t, 2, 1, 20, 80, 0));
+    try testing.expectEqual(.none, gesture.left_drag_autoscroll);
 }
 
 test "SelectionGesture autoscroll tick scrolls and continues drag" {

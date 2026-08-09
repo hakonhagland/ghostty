@@ -368,6 +368,13 @@ typedef struct {
 
   /** Height of the rendered terminal surface in surface pixels. Must be non-zero. */
   uint32_t screen_height;
+
+  /**
+   * Height of one terminal cell in surface pixels. Sizes the autoscroll
+   * trigger zone at the top and bottom edges. Zero falls back to a
+   * one-pixel zone.
+   */
+  uint32_t cell_height;
 } GhosttySelectionGestureGeometry;
 
 /**

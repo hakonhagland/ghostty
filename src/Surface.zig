@@ -1220,6 +1220,7 @@ fn selectionScrollTick(self: *Surface) !void {
             .cell_width = self.size.cell.width,
             .padding_left = self.size.padding.left,
             .screen_height = self.size.screen.height,
+            .cell_height = self.size.cell.height,
         },
     });
 
@@ -4714,6 +4715,7 @@ pub fn cursorPosCallback(
                 .cell_width = self.size.cell.width,
                 .padding_left = self.size.padding.left,
                 .screen_height = self.size.screen.height,
+                .cell_height = self.size.cell.height,
             },
         });
 

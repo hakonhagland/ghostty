@@ -203,6 +203,7 @@ pub const Geometry = extern struct {
     cell_width: u32,
     padding_left: u32,
     screen_height: u32,
+    cell_height: u32,
 
     fn toZig(self: Geometry) ?SelectionGesture.Drag.Geometry {
         if (self.columns == 0) return null;
@@ -213,6 +214,7 @@ pub const Geometry = extern struct {
             .cell_width = self.cell_width,
             .padding_left = self.padding_left,
             .screen_height = self.screen_height,
+            .cell_height = self.cell_height,
         };
     }
 };
