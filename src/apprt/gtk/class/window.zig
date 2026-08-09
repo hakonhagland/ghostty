@@ -1334,6 +1334,11 @@ pub const Window = extern struct {
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
+        // A narrower window gives each tab less room, so the titles have to be
+        // recut. setTitleBudget is a no-op when the budget is unchanged, which
+        // is most of the pixels of a drag.
+        self.updateTabTitleBudget();
+
         // X11 needs to fix blurring on resize, but winproto implementations
         // could do anything.
         self.private().winproto.resizeEvent() catch |err| {
@@ -1920,26 +1925,50 @@ pub const Window = extern struct {
         priv.tab_view.closePage(page);
     }
 
-    /// Tell every tab whether the bar is crowded enough that long path titles
-    /// should be shortened.
-    ///
-    /// The threshold is a tab count rather than a measurement. Measured on a
-    /// 1400px window, tabs keep the full title up to about eight and stop
-    /// shrinking altogether at ~118px each, so a count is a decent proxy and
-    /// costs nothing. It ignores window width, which is the known
-    /// approximation: on a narrow window titles start being cut sooner.
-    const compact_tab_threshold: c_uint = 8;
+    /// Rough width of one character of a tab title. The label is proportional,
+    /// so this is an average, and it is deliberately on the wide side: a title
+    /// trimmed slightly too far still identifies the tab, whereas one left too
+    /// long has its end eaten by the fading label, and the end is the part that
+    /// says which directory this is.
+    const tab_title_char_px: c_int = 7;
 
-    fn updateTabCompactness(self: *Self) void {
+    /// Width inside a tab that the title never gets: padding plus the close
+    /// button.
+    const tab_chrome_px: c_int = 56;
+
+    /// AdwTabBar stops shrinking tabs at roughly this width and scrolls the bar
+    /// instead, so past that point dividing by the tab count under-reports the
+    /// room a title actually has.
+    const tab_min_width_px: c_int = 118;
+
+    /// Tell every tab how much room its title has.
+    ///
+    /// This replaced a fixed eight-tab threshold, which was wrong in both
+    /// directions: on a wide window it shortened titles that fit, and on a
+    /// narrow one the fading label was already cutting them well before the
+    /// eighth tab. Width divided by tab count is the thing the threshold was
+    /// standing in for, and it is right there to measure.
+    fn updateTabTitleBudget(self: *Self) void {
         const priv = self.private();
         const n = priv.tab_view.getNPages();
-        const compact = n > compact_tab_threshold;
+        if (n <= 0) return;
+
+        // Before the bar has been allocated a width there is nothing to
+        // measure. Zero means "unknown" and leaves titles untouched, which is
+        // better than guessing and then having to redo every one of them.
+        const bar_width = priv.tab_bar.as(gtk.Widget).getWidth();
+        const budget: c_uint = if (bar_width <= 0) 0 else budget: {
+            const per_tab = @max(@divTrunc(bar_width, n), tab_min_width_px);
+            const usable = per_tab - tab_chrome_px;
+            if (usable <= 0) break :budget 1;
+            break :budget @intCast(@max(1, @divTrunc(usable, tab_title_char_px)));
+        };
 
         var i: c_int = 0;
         while (i < n) : (i += 1) {
             const page = priv.tab_view.getNthPage(i);
             const tab = gobject.ext.cast(Tab, page.getChild()) orelse continue;
-            tab.setCompact(compact);
+            tab.setTitleBudget(budget);
         }
     }
 
@@ -1949,7 +1978,7 @@ pub const Window = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
-        self.updateTabCompactness();
+        self.updateTabTitleBudget();
         if (priv.tab_view.getNPages() == 0) {
             // If we have no pages left then we want to close window.
 

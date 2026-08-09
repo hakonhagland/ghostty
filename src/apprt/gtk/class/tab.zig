@@ -142,21 +142,24 @@ pub const Tab = extern struct {
             );
         };
 
-        /// True when the tab bar is crowded enough that a long path in the
-        /// title would be cut off anyway. See `Window.updateTabCompactness`.
-        pub const compact = struct {
-            pub const name = "compact";
+        /// Roughly how many characters of title this tab can show before the
+        /// tab bar's fading label starts eating the end of it. Zero means
+        /// "unknown, don't shorten". See `Window.updateTabTitleBudget`.
+        pub const @"title-budget" = struct {
+            pub const name = "title-budget";
             const impl = gobject.ext.defineProperty(
                 name,
                 Self,
-                bool,
+                c_uint,
                 .{
-                    .default = false,
+                    .default = 0,
+                    .minimum = 0,
+                    .maximum = std.math.maxInt(c_uint),
                     .accessor = gobject.ext.privateFieldAccessor(
                         Self,
                         Private,
                         &Private.offset,
-                        "compact",
+                        "title_budget",
                     ),
                 },
             );
@@ -204,9 +207,9 @@ pub const Tab = extern struct {
         /// the `project:name` shorthand accepted by the title dialog.
         project: ?[:0]const u8 = null,
 
-        /// Whether to shorten a path-like title. Set by the window from the
-        /// tab count.
-        compact: bool = false,
+        /// How much room the title has, in characters. Set by the window from
+        /// the tab bar's actual width divided by the number of tabs.
+        title_budget: c_uint = 0,
 
         /// The tooltip of this tab. This is usually bound to the active surface.
         tooltip: ?[:0]const u8 = null,
@@ -310,11 +313,14 @@ pub const Tab = extern struct {
         return self.private().project;
     }
 
-    pub fn setCompact(self: *Self, compact: bool) void {
+    /// Set how many characters of title this tab can show. Recomputed on every
+    /// resize, so the early return matters: without it every pixel of a drag
+    /// would rebuild every tab's title string.
+    pub fn setTitleBudget(self: *Self, budget: c_uint) void {
         const priv = self.private();
-        if (priv.compact == compact) return;
-        priv.compact = compact;
-        self.as(gobject.Object).notifyByPspec(properties.compact.impl.param_spec);
+        if (priv.title_budget == budget) return;
+        priv.title_budget = budget;
+        self.as(gobject.Object).notifyByPspec(properties.@"title-budget".impl.param_spec);
     }
 
     pub fn setProject(self: *Self, project: ?[:0]const u8) void {
@@ -622,7 +628,7 @@ pub const Tab = extern struct {
         surface_override_: ?[*:0]const u8,
         tab_override_: ?[*:0]const u8,
         project_: ?[*:0]const u8,
-        compact_: c_int,
+        budget_: c_uint,
         zoomed_: c_int,
         bell_ringing_: c_int,
         _: *gobject.ParamSpec,
@@ -671,48 +677,68 @@ pub const Tab = extern struct {
             buf.writer.writeAll("🔍 ") catch {};
         }
 
-        // Once the tab bar is crowded, a long path is cut off by the fading
-        // label anyway — and it fades the *end*, which is the part that
-        // identifies the directory. Shortening from the front keeps the leaf
-        // visible. Below the threshold the whole title fits, so leave it be.
-        const shown = if (compact_ != 0) shortenPath(plain) else plain;
-
         // Prefix the project, so that the tab bar and the window title both
-        // say which project a terminal belongs to.
-        if (project_) |p| {
-            const project = std.mem.span(p);
-            if (project.len > 0) {
-                buf.writer.print("[{s}] ", .{project}) catch {};
-            }
+        // say which project a terminal belongs to. It is written first but
+        // measured first too, since it eats into what the path has left.
+        const project: []const u8 = project: {
+            const p = project_ orelse break :project "";
+            break :project std.mem.span(p);
+        };
+        if (project.len > 0) {
+            buf.writer.print("[{s}] ", .{project}) catch {};
         }
 
-        buf.writer.writeAll(shown) catch return glib.ext.dupeZ(u8, plain);
+        // Whatever the prefixes above have already consumed comes off the
+        // budget before the path gets to use it.
+        const spent = buf.written().len;
+        // Zero is the "unknown" sentinel, so never let a prefix that ate the
+        // whole budget produce one — that would read as "don't shorten" when
+        // it means the opposite.
+        const budget: usize = if (budget_ == 0) 0 else b: {
+            const total: usize = @intCast(budget_);
+            break :b @max(1, total -| spent);
+        };
+
+        buf.writer.writeAll(fitPath(plain, budget)) catch
+            return glib.ext.dupeZ(u8, plain);
         return glib.ext.dupeZ(u8, buf.written());
     }
 
-    /// Keep the last two components of a path-like title, prefixed with an
-    /// ellipsis. Anything that does not look like a path is left alone, since
-    /// a running command is not made clearer by chopping its front off.
-    fn shortenPath(title: []const u8) []const u8 {
-        if (title.len == 0) return title;
+    /// Trim a path-like title from the front until it fits `budget`
+    /// characters, dropping one leading component at a time. The tab bar's
+    /// fading label eats the *end* of a title, which is the part that
+    /// identifies the directory, so the front is what we can afford to lose.
+    ///
+    /// The leading `/` of whatever survives is left in place — it reads as a
+    /// marker that something was cut. The last component is never dropped: a
+    /// title trimmed to nothing identifies less than one that overflows.
+    ///
+    /// A budget of zero means "don't know", which happens before the tab bar
+    /// has been allocated a width. Anything that does not look like a path is
+    /// left alone, since a running command is not made clearer by chopping its
+    /// front off.
+    fn fitPath(title: []const u8, budget: usize) []const u8 {
+        if (budget == 0) return title;
+        if (title.len <= budget) return title;
         if (title[0] != '/' and title[0] != '~') return title;
 
-        var sep: ?usize = null;
-        var i: usize = title.len;
-        var seen: usize = 0;
-        while (i > 0) {
-            i -= 1;
+        // Walk separators left to right and stop at the first cut that fits,
+        // since cutting further would throw away context for nothing. If none
+        // fits we end up at the last separator, which is the leaf — the one
+        // component always worth keeping.
+        //
+        // Separators before index 2 are skipped: cutting there turns `~/x`
+        // into `/x`, which saves one character and loses the distinction
+        // between home and root.
+        var last_fit: ?usize = null;
+        var i: usize = 2;
+        while (i < title.len) : (i += 1) {
             if (title[i] != '/') continue;
-            seen += 1;
-            if (seen == 2) {
-                sep = i;
-                break;
-            }
+            last_fit = i;
+            if (title.len - i <= budget) break;
         }
 
-        const idx = sep orelse return title;
-        // Only worth it if it actually saves something.
-        if (idx <= 1) return title;
+        const idx = last_fit orelse return title;
         return title[idx..];
     }
 
@@ -746,7 +772,7 @@ pub const Tab = extern struct {
                 properties.@"split-tree".impl,
                 properties.@"surface-tree".impl,
                 properties.title.impl,
-                properties.compact.impl,
+                properties.@"title-budget".impl,
                 properties.project.impl,
                 properties.@"title-override".impl,
                 properties.tooltip.impl,
@@ -773,3 +799,44 @@ pub const Tab = extern struct {
         pub const bindTemplateCallback = C.Class.bindTemplateCallback;
     };
 };
+
+test "fitPath" {
+    const testing = std.testing;
+    const path = "/home/hakon/git/research/custom-terminal";
+
+    // Unknown budget, and budgets the title already fits, change nothing.
+    try testing.expectEqualStrings(path, Tab.fitPath(path, 0));
+    try testing.expectEqualStrings(path, Tab.fitPath(path, path.len));
+    try testing.expectEqualStrings(path, Tab.fitPath(path, path.len + 10));
+
+    // Drop only as many leading components as the budget demands.
+    try testing.expectEqualStrings(
+        "/hakon/git/research/custom-terminal",
+        Tab.fitPath(path, 35),
+    );
+    try testing.expectEqualStrings(
+        "/git/research/custom-terminal",
+        Tab.fitPath(path, 30),
+    );
+    try testing.expectEqualStrings(
+        "/research/custom-terminal",
+        Tab.fitPath(path, 25),
+    );
+
+    // The leaf survives a budget that cannot hold it.
+    try testing.expectEqualStrings(
+        "/custom-terminal",
+        Tab.fitPath(path, 5),
+    );
+
+    // A two-component path has nothing to give up.
+    try testing.expectEqualStrings("~/Downloads", Tab.fitPath("~/Downloads", 4));
+
+    // Non-paths are left alone: chopping the front off a command makes it
+    // less identifiable, not more.
+    try testing.expectEqualStrings(
+        "npm run build --watch",
+        Tab.fitPath("npm run build --watch", 5),
+    );
+    try testing.expectEqualStrings("", Tab.fitPath("", 5));
+}
