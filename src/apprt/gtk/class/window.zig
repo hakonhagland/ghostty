@@ -278,6 +278,10 @@ pub const Window = extern struct {
 
         // Template bindings
         tab_overview: *adw.TabOverview,
+        /// Handler id on the process-wide style manager. Disconnected in
+        /// dispose; see where it is connected for why that is not optional.
+        style_dark_handler: c_ulong = 0,
+
         tab_bar: *adw.TabBar,
         tab_view: *adw.TabView,
         toolbar: *adw.ToolbarView,
@@ -1542,6 +1546,14 @@ pub const Window = extern struct {
 
         priv.command_palette.deinit();
 
+        if (priv.style_dark_handler != 0) {
+            gobject.signalHandlerDisconnect(
+                adw.StyleManager.getDefault().as(gobject.Object),
+                priv.style_dark_handler,
+            );
+            priv.style_dark_handler = 0;
+        }
+
         if (priv.config) |v| {
             v.unref();
             priv.config = null;
@@ -1618,6 +1630,21 @@ pub const Window = extern struct {
                 );
             }
         }
+
+        // Project swatches carry their colour inside an SVG, so they have to be
+        // rebuilt when the theme changes rather than following the stylesheet.
+        //
+        // The style manager is a process-wide singleton and outlives every
+        // window, so this handler MUST be disconnected in dispose. Leaving it
+        // connected would leave the singleton holding a pointer to a freed
+        // window and calling into it on the next theme change.
+        self.private().style_dark_handler = gobject.Object.signals.notify.connect(
+            adw.StyleManager.getDefault(),
+            *Self,
+            styleManagerDark,
+            self,
+            .{ .detail = "dark" },
+        );
 
         // Notify every displayed surface when the compositor changes the
         // Wayland xdg_toplevel suspended state.
@@ -1847,6 +1874,18 @@ pub const Window = extern struct {
             .{},
         );
 
+        // The project swatch has to be repainted whenever the project changes,
+        // and set once now for a tab that arrived with one already — which is
+        // the common case, since a new tab inherits its parent's project.
+        _ = gobject.Object.signals.notify.connect(
+            tab,
+            *Self,
+            tabProjectChanged,
+            self,
+            .{ .detail = "project" },
+        );
+        setTabProjectIcon(page, tab);
+
         // Attach listeners for the surface.
         //
         // Interesting behavior here that was previously undocumented but
@@ -1868,6 +1907,57 @@ pub const Window = extern struct {
         // I am.
         if (tab.getSurfaceTree()) |tree| {
             self.connectSurfaceHandlers(tree);
+        }
+    }
+
+    /// Paint (or clear) the coloured dot that marks which project a tab
+    /// belongs to.
+    ///
+    /// The tab bar can only show plain text, so the project name itself cannot
+    /// be coloured there the way it is in the switcher. `AdwTabPage:icon`
+    /// takes an arbitrary `GIcon`, which is the way round: a swatch costs no
+    /// characters, and characters are the scarce resource in a crowded tab bar.
+    /// The page cannot be reached with `tab.getParent()`: AdwTabView wraps each
+    /// child in its own internal container, so the parent is not the view and
+    /// the cast silently fails, leaving every swatch unset. Ask the view.
+    fn updateTabProjectIcon(self: *Self, tab: *Tab) void {
+        const page = self.private().tab_view.getPage(tab.as(gtk.Widget));
+        setTabProjectIcon(page, tab);
+    }
+
+    fn setTabProjectIcon(page: *adw.TabPage, tab: *Tab) void {
+        if (tab.projectIcon()) |icon| {
+            defer icon.unref();
+            page.setIcon(icon);
+        } else {
+            page.setIcon(null);
+        }
+    }
+
+    fn tabProjectChanged(
+        tab: *Tab,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        self.updateTabProjectIcon(tab);
+    }
+
+    /// Repaint every swatch when the theme flips.
+    ///
+    /// The dot is an SVG with the colour baked in, so unlike the switcher's
+    /// labels it cannot follow the stylesheet on its own.
+    fn styleManagerDark(
+        _: *adw.StyleManager,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const n = priv.tab_view.getNPages();
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            const page = priv.tab_view.getNthPage(i);
+            const tab = gobject.ext.cast(Tab, page.getChild()) orelse continue;
+            setTabProjectIcon(page, tab);
         }
     }
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const adw = @import("adw");
+const gdk = @import("gdk");
 const gio = @import("gio");
 const glib = @import("glib");
 const gobject = @import("gobject");
@@ -16,6 +17,7 @@ const Application = @import("application.zig").Application;
 const SplitTree = @import("split_tree.zig").SplitTree;
 const Surface = @import("surface.zig").Surface;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
+const project_color = @import("../project_color.zig");
 
 const log = std.log.scoped(.gtk_ghostty_window);
 
@@ -331,6 +333,69 @@ pub const Tab = extern struct {
             if (v.len > 0) priv.project = glib.ext.dupeZ(u8, v);
         }
         self.as(gobject.Object).notifyByPspec(properties.project.impl.param_spec);
+    }
+
+    /// A coloured dot identifying this tab's project, or null if it has none.
+    ///
+    /// `AdwTabPage:icon` is a `GIcon` rather than a themed icon name, so it
+    /// accepts an arbitrary image — which is the only way colour reaches the
+    /// tab bar at all. A symbolic icon would not do: GTK recolours those to the
+    /// foreground colour, so every project would come out the same hue.
+    ///
+    /// The pixels are built here rather than handed over as an SVG in a
+    /// `GBytesIcon`. That was the first attempt and it **segfaults**: GTK routes
+    /// encoded image bytes through glycin, which calls into fontconfig, which
+    /// dies inside a process already using fontconfig for its own font
+    /// discovery. A `GdkMemoryTexture` implements `GIcon` directly and runs no
+    /// decoder at all, so nothing but our own bytes is involved.
+    ///
+    /// The caller owns the returned reference.
+    pub fn projectIcon(self: *Self) ?*gio.Icon {
+        const project = self.private().project orelse return null;
+        if (project.len == 0) return null;
+
+        // The stylesheet is not reachable from raw pixels, so the theme has to
+        // be asked directly and the icon rebuilt when it changes.
+        const colour = project_color.rgb(
+            project,
+            adw.StyleManager.getDefault().getDark() != 0,
+        );
+
+        const size = 16;
+        const radius: f32 = 5;
+        const centre: f32 = (size - 1) / 2;
+
+        // Premultiplied, so each channel is scaled by coverage along with the
+        // alpha; writing unpremultiplied values here produces a dark halo.
+        var px: [size * size * 4]u8 = undefined;
+        for (0..size) |y| {
+            for (0..size) |x| {
+                const dx = @as(f32, @floatFromInt(x)) - centre;
+                const dy = @as(f32, @floatFromInt(y)) - centre;
+                const d = @sqrt(dx * dx + dy * dy);
+
+                // One pixel of feathering at the rim. Without it a 16px circle
+                // reads as a jagged blob at this size.
+                const coverage = std.math.clamp(radius - d + 0.5, 0, 1);
+
+                const i = (y * size + x) * 4;
+                px[i + 0] = @intFromFloat(@as(f32, @floatFromInt(colour[0])) * coverage);
+                px[i + 1] = @intFromFloat(@as(f32, @floatFromInt(colour[1])) * coverage);
+                px[i + 2] = @intFromFloat(@as(f32, @floatFromInt(colour[2])) * coverage);
+                px[i + 3] = @intFromFloat(255 * coverage);
+            }
+        }
+
+        const bytes = glib.Bytes.new(&px, px.len);
+        defer bytes.unref();
+        const texture = gdk.MemoryTexture.new(
+            size,
+            size,
+            .r8g8b8a8_premultiplied,
+            bytes,
+            size * 4,
+        );
+        return texture.as(gio.Icon);
     }
 
     pub fn setTitleOverride(self: *Self, title: ?[:0]const u8) void {

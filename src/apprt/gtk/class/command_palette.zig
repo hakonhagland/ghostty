@@ -15,6 +15,7 @@ const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const key = @import("../key.zig");
 const WeakRef = @import("../weak_ref.zig").WeakRef;
+const project_color = @import("../project_color.zig");
 const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
 const Window = @import("window.zig").Window;
@@ -1302,30 +1303,9 @@ const Command = extern struct {
         }
     }
 
-    /// The number of `.project-N` classes defined in the stylesheets.
-    const project_colours: u64 = 8;
-
     fn propGetProjectCss(self: *Self) ?[:0]const u8 {
         const project = self.propGetProject() orelse return null;
-
-        // FNV-1a. Any stable hash would do; what matters is that the same
-        // name always lands on the same colour, including across restarts.
-        var hash: u64 = 0xcbf29ce484222325;
-        for (project) |b| {
-            hash ^= b;
-            hash *%= 0x100000001b3;
-        }
-
-        return switch (hash % project_colours) {
-            0 => "project-0",
-            1 => "project-1",
-            2 => "project-2",
-            3 => "project-3",
-            4 => "project-4",
-            5 => "project-5",
-            6 => "project-6",
-            else => "project-7",
-        };
+        return project_color.cssClass(project);
     }
 
     fn propGetHasProject(self: *Self) bool {
