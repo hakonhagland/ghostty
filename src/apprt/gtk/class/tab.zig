@@ -206,7 +206,7 @@ pub const Tab = extern struct {
         title_override: ?[:0]const u8 = null,
 
         /// The project this tab belongs to, from `promptTabProject` or from
-        /// the `project:name` shorthand accepted by the title dialog.
+        /// the `@project` prefix accepted by the switcher.
         project: ?[:0]const u8 = null,
 
         /// How much room the title has, in characters. Set by the window from
@@ -416,31 +416,11 @@ pub const Tab = extern struct {
             return;
         }
 
-        // "project:name" is accepted as shorthand so that a project can be
-        // assigned without a second trip through the dialog. Only what the
-        // user typed here is ever split this way; the terminal-reported title
-        // is not, because colons are common in it.
-        if (std.mem.indexOfScalar(u8, typed, ':')) |idx| {
-            const project = std.mem.trim(u8, typed[0..idx], " ");
-            const name = std.mem.trim(u8, typed[idx + 1 ..], " ");
-            if (project.len > 0) {
-                // Allocate a sentinel copy; the incoming slice is borrowed.
-                const alloc = Application.default().allocator();
-                if (alloc.dupeZ(u8, project)) |p| {
-                    defer alloc.free(p);
-                    self.setProject(p);
-                } else |_| {}
-
-                if (name.len == 0) {
-                    self.setTitleOverride(null);
-                } else if (alloc.dupeZ(u8, name)) |t| {
-                    defer alloc.free(t);
-                    self.setTitleOverride(t);
-                } else |_| {}
-                return;
-            }
-        }
-
+        // The `project:name` shorthand used to be accepted here. It has been
+        // retired: `Ctrl+P` sets a project directly, and the new terminal
+        // dialog names the field outright, so the shorthand only survived as a
+        // second convention to learn — and one that made a colon in a title
+        // mean something. A title is now just a title.
         self.setTitleOverride(typed);
     }
 
