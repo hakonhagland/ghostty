@@ -233,3 +233,33 @@ label.resize-overlay {
   margin: 0;
   padding: 0;
 }
+
+/*
+ * Per-project accents in the session search. Assigned by hashing the
+ * project name, so a project keeps its colour across restarts without any
+ * configuration.
+ */
+#project-0 {
+  color: #1c71d8;
+}
+#project-1 {
+  color: #00887a;
+}
+#project-2 {
+  color: #1b8c3f;
+}
+#project-3 {
+  color: #8f6800;
+}
+#project-4 {
+  color: #b3541e;
+}
+#project-5 {
+  color: #c01c28;
+}
+#project-6 {
+  color: #a2258f;
+}
+#project-7 {
+  color: #7239b3;
+}

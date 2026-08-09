@@ -6,3 +6,33 @@
   background-color: rgba(36, 36, 36, 1);
   background-clip: content-box;
 }
+
+/*
+ * Per-project accents in the session search. Assigned by hashing the
+ * project name, so a project keeps its colour across restarts without any
+ * configuration.
+ */
+#project-0 {
+  color: #78aeed;
+}
+#project-1 {
+  color: #4dd8c4;
+}
+#project-2 {
+  color: #78e08f;
+}
+#project-3 {
+  color: #f8e45c;
+}
+#project-4 {
+  color: #ffbe6f;
+}
+#project-5 {
+  color: #ff938c;
+}
+#project-6 {
+  color: #ff9ae3;
+}
+#project-7 {
+  color: #dc8add;
+}

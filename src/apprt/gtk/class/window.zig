@@ -1920,12 +1920,36 @@ pub const Window = extern struct {
         priv.tab_view.closePage(page);
     }
 
+    /// Tell every tab whether the bar is crowded enough that long path titles
+    /// should be shortened.
+    ///
+    /// The threshold is a tab count rather than a measurement. Measured on a
+    /// 1400px window, tabs keep the full title up to about eight and stop
+    /// shrinking altogether at ~118px each, so a count is a decent proxy and
+    /// costs nothing. It ignores window width, which is the known
+    /// approximation: on a narrow window titles start being cut sooner.
+    const compact_tab_threshold: c_uint = 8;
+
+    fn updateTabCompactness(self: *Self) void {
+        const priv = self.private();
+        const n = priv.tab_view.getNPages();
+        const compact = n > compact_tab_threshold;
+
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            const page = priv.tab_view.getNthPage(i);
+            const tab = gobject.ext.cast(Tab, page.getChild()) orelse continue;
+            tab.setCompact(compact);
+        }
+    }
+
     fn tabViewNPages(
         _: *adw.TabView,
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
+        self.updateTabCompactness();
         if (priv.tab_view.getNPages() == 0) {
             // If we have no pages left then we want to close window.
 

@@ -954,6 +954,29 @@ const Command = extern struct {
             );
         };
 
+        /// The CSS class carrying this project's colour, e.g. "project-3".
+        /// Assigned by hashing the name so a project keeps its colour across
+        /// restarts with no configuration.
+        pub const @"project-css" = struct {
+            pub const name = "project-css";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        ?[:0]const u8,
+                        .{
+                            .getter = propGetProjectCss,
+                            .getter_transfer = .none,
+                        },
+                    ),
+                },
+            );
+        };
+
         /// Whether `project` is set. Exists so that the row template can bind
         /// the project label's visibility without needing a closure.
         pub const @"has-project" = struct {
@@ -1279,6 +1302,32 @@ const Command = extern struct {
         }
     }
 
+    /// The number of `.project-N` classes defined in the stylesheets.
+    const project_colours: u64 = 8;
+
+    fn propGetProjectCss(self: *Self) ?[:0]const u8 {
+        const project = self.propGetProject() orelse return null;
+
+        // FNV-1a. Any stable hash would do; what matters is that the same
+        // name always lands on the same colour, including across restarts.
+        var hash: u64 = 0xcbf29ce484222325;
+        for (project) |b| {
+            hash ^= b;
+            hash *%= 0x100000001b3;
+        }
+
+        return switch (hash % project_colours) {
+            0 => "project-0",
+            1 => "project-1",
+            2 => "project-2",
+            3 => "project-3",
+            4 => "project-4",
+            5 => "project-5",
+            6 => "project-6",
+            else => "project-7",
+        };
+    }
+
     fn propGetHasProject(self: *Self) bool {
         return self.propGetProject() != null;
     }
@@ -1421,6 +1470,7 @@ const Command = extern struct {
                 properties.title.impl,
                 properties.description.impl,
                 properties.project.impl,
+                properties.@"project-css".impl,
                 properties.@"has-project".impl,
                 properties.subtitle.impl,
             });

@@ -142,6 +142,26 @@ pub const Tab = extern struct {
             );
         };
 
+        /// True when the tab bar is crowded enough that a long path in the
+        /// title would be cut off anyway. See `Window.updateTabCompactness`.
+        pub const compact = struct {
+            pub const name = "compact";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                bool,
+                .{
+                    .default = false,
+                    .accessor = gobject.ext.privateFieldAccessor(
+                        Self,
+                        Private,
+                        &Private.offset,
+                        "compact",
+                    ),
+                },
+            );
+        };
+
         pub const @"title-override" = struct {
             pub const name = "title-override";
             const impl = gobject.ext.defineProperty(
@@ -183,6 +203,10 @@ pub const Tab = extern struct {
         /// The project this tab belongs to, from `promptTabProject` or from
         /// the `project:name` shorthand accepted by the title dialog.
         project: ?[:0]const u8 = null,
+
+        /// Whether to shorten a path-like title. Set by the window from the
+        /// tab count.
+        compact: bool = false,
 
         /// The tooltip of this tab. This is usually bound to the active surface.
         tooltip: ?[:0]const u8 = null,
@@ -284,6 +308,13 @@ pub const Tab = extern struct {
     /// The project this tab belongs to, if the user has assigned one.
     pub fn getProject(self: *Self) ?[:0]const u8 {
         return self.private().project;
+    }
+
+    pub fn setCompact(self: *Self, compact: bool) void {
+        const priv = self.private();
+        if (priv.compact == compact) return;
+        priv.compact = compact;
+        self.as(gobject.Object).notifyByPspec(properties.compact.impl.param_spec);
     }
 
     pub fn setProject(self: *Self, project: ?[:0]const u8) void {
@@ -590,6 +621,8 @@ pub const Tab = extern struct {
         terminal_: ?[*:0]const u8,
         surface_override_: ?[*:0]const u8,
         tab_override_: ?[*:0]const u8,
+        project_: ?[*:0]const u8,
+        compact_: c_int,
         zoomed_: c_int,
         bell_ringing_: c_int,
         _: *gobject.ParamSpec,
@@ -638,8 +671,49 @@ pub const Tab = extern struct {
             buf.writer.writeAll("🔍 ") catch {};
         }
 
-        buf.writer.writeAll(plain) catch return glib.ext.dupeZ(u8, plain);
+        // Once the tab bar is crowded, a long path is cut off by the fading
+        // label anyway — and it fades the *end*, which is the part that
+        // identifies the directory. Shortening from the front keeps the leaf
+        // visible. Below the threshold the whole title fits, so leave it be.
+        const shown = if (compact_ != 0) shortenPath(plain) else plain;
+
+        // Prefix the project, so that the tab bar and the window title both
+        // say which project a terminal belongs to.
+        if (project_) |p| {
+            const project = std.mem.span(p);
+            if (project.len > 0) {
+                buf.writer.print("[{s}] ", .{project}) catch {};
+            }
+        }
+
+        buf.writer.writeAll(shown) catch return glib.ext.dupeZ(u8, plain);
         return glib.ext.dupeZ(u8, buf.written());
+    }
+
+    /// Keep the last two components of a path-like title, prefixed with an
+    /// ellipsis. Anything that does not look like a path is left alone, since
+    /// a running command is not made clearer by chopping its front off.
+    fn shortenPath(title: []const u8) []const u8 {
+        if (title.len == 0) return title;
+        if (title[0] != '/' and title[0] != '~') return title;
+
+        var sep: ?usize = null;
+        var i: usize = title.len;
+        var seen: usize = 0;
+        while (i > 0) {
+            i -= 1;
+            if (title[i] != '/') continue;
+            seen += 1;
+            if (seen == 2) {
+                sep = i;
+                break;
+            }
+        }
+
+        const idx = sep orelse return title;
+        // Only worth it if it actually saves something.
+        if (idx <= 1) return title;
+        return title[idx..];
     }
 
     const C = Common(Self, Private);
@@ -672,6 +746,7 @@ pub const Tab = extern struct {
                 properties.@"split-tree".impl,
                 properties.@"surface-tree".impl,
                 properties.title.impl,
+                properties.compact.impl,
                 properties.project.impl,
                 properties.@"title-override".impl,
                 properties.tooltip.impl,
