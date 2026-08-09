@@ -431,7 +431,7 @@ pub const Window = extern struct {
 
     /// Create a new tab in this window with a manually set title.
     ///
-    /// If the title names a project (`project:name`) that some existing tab
+    /// If the query names a project (`@project`) that some existing tab
     /// already belongs to, the new tab starts in that project's most recently
     /// used working directory. Otherwise it inherits from the active surface
     /// as a new tab normally would.
@@ -440,21 +440,41 @@ pub const Window = extern struct {
     ///
     /// Split out from `newTabTitled` so that the session search can show the
     /// directory a new terminal will start in before you commit to creating it.
-    /// Split text the user typed into the switcher into "project:name".
+    /// Split text the user typed into the switcher into a project and the rest.
     ///
-    /// Only ever applied to what the user typed, never to a terminal-reported
-    /// title, so the colons that appear in running commands are not a hazard.
-    /// A trailing colon means a project with no custom name.
-    fn splitTyped(typed: []const u8) struct { ?[]const u8, []const u8 } {
-        const idx = std.mem.indexOfScalar(u8, typed, ':') orelse
-            return .{ null, typed };
-        const project = std.mem.trim(u8, typed[0..idx], " ");
-        if (project.len == 0) return .{ null, typed };
-        return .{ project, std.mem.trim(u8, typed[idx + 1 ..], " ") };
+    /// `@project rest` — a leading `@`, then a project name terminated by a
+    /// space. Anything else is all "rest" and names no project.
+    ///
+    /// The separator is a space rather than the `:` this used to use, and that
+    /// matters for searching as much as creating. With `project:name` there was
+    /// no way to narrow towards a project while typing: `f:` had to name a
+    /// project called exactly `f` before it meant anything. With a leading
+    /// sigil, `@f`, `@fo` and `@foo` are all valid intermediate states, each
+    /// narrowing further.
+    ///
+    /// It also retires a hazard rather than guarding against one. Only the
+    /// first character is significant, so a colon anywhere in a path or a
+    /// running command cannot be mistaken for a separator.
+    pub fn parseQuery(typed: []const u8) struct { ?[]const u8, []const u8 } {
+        const trimmed = std.mem.trim(u8, typed, " ");
+        if (trimmed.len == 0 or trimmed[0] != '@') return .{ null, typed };
+
+        const rest = trimmed[1..];
+
+        // A bare `@` names no project *yet*. Treating it as a filter would make
+        // every row vanish the instant the sigil is typed, which is the worst
+        // possible moment: it reads as "there is nothing here" exactly when the
+        // user has committed to narrowing and has not yet said to what. An
+        // empty query shows everything, so a bare sigil should too.
+        if (rest.len == 0) return .{ null, "" };
+
+        const idx = std.mem.indexOfScalar(u8, rest, ' ') orelse
+            return .{ rest, "" };
+        return .{ rest[0..idx], std.mem.trim(u8, rest[idx + 1 ..], " ") };
     }
 
     /// The project of the tab we are currently in, if it has one.
-    fn currentProject(self: *Self) ?[:0]const u8 {
+    pub fn currentProject(self: *Self) ?[:0]const u8 {
         const surface = self.getActiveSurface() orelse return null;
         const tab = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse return null;
         return tab.getProject();
@@ -494,7 +514,7 @@ pub const Window = extern struct {
         // An explicitly typed project wins; otherwise the new terminal joins
         // the project of the one we are in, which is what makes creating a
         // second terminal in the same project need no typing at all.
-        const project = splitTyped(typed)[0] orelse self.currentProject();
+        const project = parseQuery(typed)[0] orelse self.currentProject();
         if (project) |p| {
             if (projectCwd(p)) |cwd| return cwd;
         }
@@ -521,10 +541,40 @@ pub const Window = extern struct {
         }
     }
 
+    /// Create a tab with an explicit name and project, as chosen in the new
+    /// terminal dialog. Either may be empty, meaning "none".
+    ///
+    /// `newTabTitled` parses one typed string; this takes the two fields
+    /// already separated, so a project or a name containing a space or an `@`
+    /// survives intact.
+    pub fn newTabWith(self: *Self, name: []const u8, project: []const u8) void {
+        const parent = if (self.getActiveSurface()) |v| v.core() else null;
+        const alloc = Application.default().allocator();
+
+        const project_z: ?[:0]const u8 = if (project.len == 0)
+            null
+        else
+            alloc.dupeZ(u8, project) catch null;
+        defer if (project_z) |p| alloc.free(p);
+
+        const cwd = if (project_z) |p| projectCwd(p) else null;
+
+        const page = self.newTabPage(parent, .tab, .{ .working_directory = cwd });
+        const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
+
+        if (project_z) |p| tab.setProject(p);
+        if (name.len > 0) {
+            if (alloc.dupeZ(u8, name)) |t| {
+                defer alloc.free(t);
+                tab.setTitleOverride(t);
+            } else |_| {}
+        }
+    }
+
     pub fn newTabTitled(self: *Self, typed: [:0]const u8) void {
         const parent = if (self.getActiveSurface()) |v| v.core() else null;
 
-        const typed_project, const name = splitTyped(typed);
+        const typed_project, const name = parseQuery(typed);
         const inherited = if (typed_project == null) self.currentProject() else null;
 
         const alloc = Application.default().allocator();
@@ -2634,3 +2684,38 @@ pub const Window = extern struct {
         pub const bindTemplateCallback = C.Class.bindTemplateCallback;
     };
 };
+
+test "parseQuery" {
+    const testing = std.testing;
+    const P = Window.parseQuery;
+
+    // No sigil: everything is "rest", untouched.
+    try testing.expectEqual(@as(?[]const u8, null), P("download")[0]);
+    try testing.expectEqualStrings("download", P("download")[1]);
+
+    // A colon is just a character now, which is the point of the change.
+    try testing.expectEqual(@as(?[]const u8, null), P("http://x:8080")[0]);
+    try testing.expectEqualStrings("http://x:8080", P("http://x:8080")[1]);
+
+    // Sigil alone, and partial names, so narrowing works while typing.
+    try testing.expectEqualStrings("f", P("@f")[0].?);
+    try testing.expectEqualStrings("fo", P("@fo")[0].?);
+    try testing.expectEqualStrings("foo", P("@foo")[0].?);
+    try testing.expectEqualStrings("", P("@foo")[1]);
+
+    // Project and rest.
+    try testing.expectEqualStrings("foo", P("@foo download")[0].?);
+    try testing.expectEqualStrings("download", P("@foo download")[1]);
+
+    // Extra spaces collapse; the rest keeps its own internal spaces.
+    try testing.expectEqualStrings("foo", P("  @foo   a b  ")[0].?);
+    try testing.expectEqualStrings("a b", P("  @foo   a b  ")[1]);
+
+    // A bare sigil names no project yet, and must behave like an empty query
+    // rather than filtering everything away the moment it is typed.
+    try testing.expectEqual(@as(?[]const u8, null), P("@")[0]);
+    try testing.expectEqualStrings("", P("@")[1]);
+    try testing.expectEqual(@as(?[]const u8, null), P("  @  ")[0]);
+    try testing.expectEqualStrings("", P("  @  ")[1]);
+    try testing.expectEqualStrings("", P("")[1]);
+}

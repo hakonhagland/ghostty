@@ -55,17 +55,11 @@ Adw.Dialog dialog {
           model: Gtk.FilterListModel {
             incremental: true;
 
-            filter: Gtk.AnyFilter {
-              Gtk.StringFilter {
-                expression: expr item as <$GhosttyCommand>.title;
-                search: bind search.text;
-              }
-
-              Gtk.StringFilter {
-                expression: expr item as <$GhosttyCommand>.action-key;
-                search: bind search.text;
-              }
-            };
+            // A custom filter rather than a pair of StringFilters, because
+            // "@project rest" cannot be expressed as one search string matched
+            // against one property. The match function lives in
+            // command_palette.zig.
+            filter: Gtk.CustomFilter filter {};
 
             model: Gio.ListStore source {
               item-type: typeof<$GhosttyCommand>;

@@ -1,0 +1,27 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $GhosttyNewTerminalDialog: Adw.AlertDialog {
+  heading: _("New Terminal");
+  body: _("Leave the name blank to keep the terminal's own title, or the project blank for none.");
+
+  responses [
+    cancel: _("Cancel"),
+    ok: _("Create") suggested,
+  ]
+
+  default-response: "ok";
+  focus-widget: name_entry;
+
+  extra-child: Adw.PreferencesGroup {
+    Adw.EntryRow name_entry {
+      title: _("Name");
+      activates-default: true;
+    }
+
+    Adw.EntryRow project_entry {
+      title: _("Project");
+      activates-default: true;
+    }
+  };
+}

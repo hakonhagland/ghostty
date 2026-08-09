@@ -16,6 +16,7 @@ const gresource = @import("../build/gresource.zig");
 const key = @import("../key.zig");
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const project_color = @import("../project_color.zig");
+const NewTerminalDialog = @import("new_terminal_dialog.zig").NewTerminalDialog;
 const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
 const Window = @import("window.zig").Window;
@@ -104,6 +105,10 @@ pub const CommandPalette = extern struct {
         /// The view containing each result row.
         view: *gtk.ListView,
 
+        /// The filter deciding which rows the query matches. Owned by the
+        /// template; the match function is installed in `init`.
+        filter: *gtk.CustomFilter,
+
         /// The model that provides filtered data for the view to display.
         model: *gtk.SingleSelection,
 
@@ -149,6 +154,12 @@ pub const CommandPalette = extern struct {
 
     fn init(self: *Self, _: *Class) callconv(.c) void {
         gtk.Widget.initTemplate(self.as(gtk.Widget));
+
+        self.private().filter.setFilterFunc(
+            filterMatch,
+            self,
+            null,
+        );
 
         // Listen for any changes to our config.
         _ = gobject.Object.signals.notify.connect(
@@ -239,6 +250,14 @@ pub const CommandPalette = extern struct {
         if (is_return) {
             const window = priv.window.get() orelse return 0;
             defer window.unref();
+
+            // Shift turns the fast path into the deliberate one. Ctrl+Enter
+            // exists to skip deliberation entirely, so the dialog is a
+            // separate binding rather than something imposed on it.
+            if (state.shift_mask) {
+                self.promptNewTerminal();
+                return 1;
+            }
 
             self.close();
             window.newTabUntitled();
@@ -418,9 +437,12 @@ pub const CommandPalette = extern struct {
         };
 
         // The placeholder tells the user what this invocation will search.
+        // The placeholder is where `@project` gets discovered: it is visible
+        // before anything has been typed, which is exactly when someone is
+        // wondering what the box accepts. The footer is already full.
         priv.search.setPlaceholderText(switch (priv.mode) {
             .all => i18n._("Execute a command…"),
-            .jump => i18n._("Switch to a terminal…"),
+            .jump => i18n._("Switch to a terminal, or @project…"),
         });
 
         // The session search has shortcuts that nothing else advertises, so
@@ -428,7 +450,7 @@ pub const CommandPalette = extern struct {
         const show_hints = priv.mode == .jump;
         priv.hints.as(gtk.Widget).setVisible(@intFromBool(show_hints));
         if (show_hints) priv.hints.setLabel(
-            i18n._("Enter switch · Ctrl+Enter new · Ctrl+R rename · Ctrl+P project"),
+            i18n._("Enter switch · Ctrl+Enter new · Ctrl+Shift+Enter new… · Ctrl+R rename · Ctrl+P project"),
         );
 
         // Clear existing binds
@@ -620,8 +642,60 @@ pub const CommandPalette = extern struct {
         self.unref();
     }
 
+    /// Case-insensitive substring test, which is what every other quick-open
+    /// picker means by "matches".
+    fn contains(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0) return true;
+        return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    }
+
+    /// Decide whether one row passes the current query.
+    ///
+    /// `@project rest` narrows to terminals in a project whose name contains
+    /// `project`, and then applies `rest` as an ordinary search within them.
+    /// Both halves are optional: `@web` is every terminal in `web`, and a query
+    /// with no sigil behaves exactly as it did before.
+    fn filterMatch(item: *gobject.Object, ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 1));
+        const priv = self.private();
+        const cmd = gobject.ext.cast(Command, item) orelse return 1;
+
+        const text = std.mem.span(priv.search.as(gtk.Editable).getText());
+        const project_q, const rest = Window.parseQuery(text);
+
+        // The create row *is* the query, so it always belongs in the list. It
+        // used to stay visible by repeating the query in its own label, which
+        // only worked while the filter was a plain substring match.
+        if (cmd.isCreate()) return 1;
+
+        if (project_q) |q| {
+            // A project query is only meaningful for terminals.
+            if (!cmd.isJump()) return 0;
+            const project = cmd.propGetProject() orelse return 0;
+            if (!contains(project, q)) return 0;
+        }
+
+        if (rest.len == 0) return 1;
+
+        if (cmd.propGetTitle()) |title| {
+            if (contains(title, rest)) return 1;
+        }
+        // The working directory is the subtitle once a terminal has been given
+        // a name of its own, so without this a renamed terminal stops being
+        // findable by where it is.
+        if (cmd.propGetSubtitle()) |subtitle| {
+            if (contains(subtitle, rest)) return 1;
+        }
+        if (cmd.propGetActionKey()) |action_key| {
+            if (contains(action_key, rest)) return 1;
+        }
+
+        return 0;
+    }
+
     fn searchChanged(_: *gtk.SearchEntry, self: *CommandPalette) callconv(.c) void {
         self.syncCreateCommand();
+        self.private().filter.as(gtk.Filter).changed(.different);
     }
 
     /// Keep the synthetic "create a terminal" row in step with the query.
@@ -653,6 +727,11 @@ pub const CommandPalette = extern struct {
         const query = std.mem.trim(u8, text, " ");
         if (query.len == 0) return;
 
+        // A bare `@` is a sigil with nothing after it, so there is nothing to
+        // create yet. Without this the row reads `Create terminal ""`.
+        const parsed_project, const parsed_name = Window.parseQuery(query);
+        if (parsed_project == null and parsed_name.len == 0) return;
+
         const cwd = if (priv.window.get()) |window| cwd: {
             defer window.unref();
             break :cwd window.newTabCwdFor(query);
@@ -665,6 +744,59 @@ pub const CommandPalette = extern struct {
 
         priv.create_cmd = cmd;
         priv.source.append(cmd.as(gobject.Object));
+    }
+
+    /// Open the new terminal dialog, prefilled from the query and from what is
+    /// selected.
+    ///
+    /// Deliberately does *not* close the palette. Cancelling should land you
+    /// back in the list you were looking at — you were narrowing towards
+    /// something, and being thrown out of the switcher for changing your mind
+    /// costs the whole search. The palette closes only once a terminal is
+    /// actually created.
+    fn promptNewTerminal(self: *Self) void {
+        const priv = self.private();
+        const window = priv.window.get() orelse return;
+        defer window.unref();
+
+        const text = std.mem.span(priv.search.as(gtk.Editable).getText());
+        const typed_project, const name = Window.parseQuery(text);
+
+        // A typed project is a *fragment* being narrowed with — `@f` on the way
+        // to `foo`. Prefilling the dialog with `f` would put the fragment into
+        // a field that is no longer being filtered, where it silently becomes a
+        // real project name. The selected row already says which project the
+        // fragment resolved to, so prefer that.
+        const project: []const u8 = project: {
+            if (self.selectedTab()) |tab| {
+                if (tab.getProject()) |p| break :project p;
+            }
+            if (typed_project) |p| break :project p;
+            break :project window.currentProject() orelse "";
+        };
+
+        const dialog = NewTerminalDialog.new(name, project);
+        _ = NewTerminalDialog.signals.create.connect(
+            dialog,
+            *Self,
+            newTerminalCreate,
+            self,
+            .{},
+        );
+        dialog.present(self.as(gtk.Widget));
+    }
+
+    fn newTerminalCreate(
+        _: *NewTerminalDialog,
+        name: [*:0]const u8,
+        project: [*:0]const u8,
+        self: *Self,
+    ) callconv(.c) void {
+        const window = self.private().window.get() orelse return;
+        defer window.unref();
+
+        self.close();
+        window.newTabWith(std.mem.span(name), std.mem.span(project));
     }
 
     fn searchStopped(_: *gtk.SearchEntry, self: *CommandPalette) callconv(.c) void {
@@ -743,12 +875,13 @@ pub const CommandPalette = extern struct {
             return;
         }
 
-        // The synthetic create row makes a new terminal named after the query.
+        // The synthetic create row opens the dialog rather than creating
+        // straight away. Both fields are prefilled from the query, so
+        // accepting is one Enter, and the fields are visible — which is the
+        // only place the rules about naming are actually discoverable.
+        // Ctrl+Enter remains the path that creates with no prompt at all.
         if (cmd.isCreate()) {
-            const query = cmd.getCreateQuery() orelse return;
-            const window = priv.window.get() orelse return;
-            defer window.unref();
-            window.newTabTitled(query);
+            self.promptNewTerminal();
             return;
         }
 
@@ -793,6 +926,7 @@ pub const CommandPalette = extern struct {
             class.bindTemplateChildPrivate("search", .{});
             class.bindTemplateChildPrivate("view", .{});
             class.bindTemplateChildPrivate("model", .{});
+            class.bindTemplateChildPrivate("filter", .{});
             class.bindTemplateChildPrivate("source", .{});
             class.bindTemplateChildPrivate("hints", .{});
 
@@ -1270,14 +1404,35 @@ const Command = extern struct {
             .regular => |*r| return r.command.title,
             .create => |*c| {
                 if (c.title) |t| return t;
-                c.title = std.fmt.allocPrintSentinel(
-                    priv.arena.allocator(),
-                    // The query is repeated in the label so that the row keeps
-                    // matching the search filter as the user types.
-                    "Create terminal \"{s}\"",
-                    .{c.query},
-                    0,
-                ) catch null;
+
+                // Show what will actually be made, not what was typed. The
+                // label used to echo the raw query so the row kept passing a
+                // plain substring filter; the filter now passes create rows
+                // unconditionally, so the label is free to be useful.
+                const project, const name = Window.parseQuery(c.query);
+                const alloc = priv.arena.allocator();
+                c.title = title: {
+                    if (project) |p| {
+                        if (name.len == 0) break :title std.fmt.allocPrintSentinel(
+                            alloc,
+                            "Create terminal in \"{s}\"",
+                            .{p},
+                            0,
+                        ) catch null;
+                        break :title std.fmt.allocPrintSentinel(
+                            alloc,
+                            "Create terminal \"{s}\" in \"{s}\"",
+                            .{ name, p },
+                            0,
+                        ) catch null;
+                    }
+                    break :title std.fmt.allocPrintSentinel(
+                        alloc,
+                        "Create terminal \"{s}\"",
+                        .{name},
+                        0,
+                    ) catch null;
+                };
                 return c.title;
             },
             .jump => |*j| {
