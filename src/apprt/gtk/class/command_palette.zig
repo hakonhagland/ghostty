@@ -1375,6 +1375,10 @@ const Command = extern struct {
         self.as(gobject.Object).notifyByPspec(properties.title.impl.param_spec);
         self.as(gobject.Object).notifyByPspec(properties.project.impl.param_spec);
         self.as(gobject.Object).notifyByPspec(properties.@"has-project".impl.param_spec);
+        // The colour is derived from the name, so it is stale too. Forgetting
+        // this left a freshly assigned project uncoloured until the palette was
+        // closed and reopened, which is exactly when a user checks their work.
+        self.as(gobject.Object).notifyByPspec(properties.@"project-css".impl.param_spec);
     }
 
     /// The text the user had typed when this create row was built.
