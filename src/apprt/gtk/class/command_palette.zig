@@ -205,8 +205,14 @@ pub const CommandPalette = extern struct {
         self: *Self,
     ) callconv(.c) c_int {
         const priv = self.private();
-        if (priv.mode != .jump) return 0;
 
+        // Arrow-key navigation applies in **both** modes. F4 restored the plain
+        // palette to be pixel-identical to upstream and gated every key here on
+        // the session search; that was right for the shortcuts below, which add
+        // behaviour upstream does not have, but wrong for this. Two dialogs that
+        // look the same and answer the arrow keys differently is a worse
+        // surprise than either behaviour on its own.
+        //
         // Drive the selection ourselves rather than letting GTK move focus
         // into the list.
         //
@@ -242,6 +248,10 @@ pub const CommandPalette = extern struct {
             priv.view.scrollTo(next, .{}, null);
             return 1;
         }
+
+        // Everything below is session-search behaviour that the plain palette
+        // deliberately does not have.
+        if (priv.mode != .jump) return 0;
 
         const is_return = keyval == gdk.KEY_Return or
             keyval == gdk.KEY_KP_Enter or
