@@ -87,6 +87,11 @@ pub const CommandPalette = extern struct {
         /// Only the open terminals. Used for switching between terminals
         /// without the configured commands in the way.
         jump,
+
+        /// Only the configured keybindings, searchable by action or by the
+        /// keys themselves. `ghostty +list-keybinds` prints the same thing,
+        /// but only from a terminal.
+        keybinds,
     };
 
     const Private = struct {
@@ -453,6 +458,7 @@ pub const CommandPalette = extern struct {
         priv.search.setPlaceholderText(switch (priv.mode) {
             .all => i18n._("Execute a command…"),
             .jump => i18n._("Switch to a terminal, or @project…"),
+            .keybinds => i18n._("Search keybindings by action or by key…"),
         });
 
         // The session search has shortcuts that nothing else advertises, so
@@ -477,11 +483,15 @@ pub const CommandPalette = extern struct {
             commands.deinit(alloc);
         }
 
-        self.collectJumpCommands(config, &commands) catch |err| {
-            log.warn("failed to collect jump commands: {}", .{err});
-        };
+        if (priv.mode == .keybinds) {
+            self.collectKeybindCommands(config, &commands, alloc);
+        } else {
+            self.collectJumpCommands(config, &commands) catch |err| {
+                log.warn("failed to collect jump commands: {}", .{err});
+            };
 
-        if (priv.mode == .all) self.collectRegularCommands(config, &commands, alloc);
+            if (priv.mode == .all) self.collectRegularCommands(config, &commands, alloc);
+        }
 
         // Sort commands
         std.mem.sort(*Command, commands.items, {}, struct {
@@ -517,6 +527,41 @@ pub const CommandPalette = extern struct {
     }
 
     /// Collect regular commands from configuration, filtering out unsupported actions.
+    /// Build one row per configured keybinding.
+    ///
+    /// Sequences (leader keys) are skipped: a chord has no single trigger to
+    /// print, and showing only its first key would be a lie about what is
+    /// bound.
+    fn collectKeybindCommands(
+        _: *CommandPalette,
+        config: *Config,
+        commands: *std.ArrayList(*Command),
+        alloc: std.mem.Allocator,
+    ) void {
+        const cfg = config.get();
+        var it = cfg.keybind.set.bindings.iterator();
+        while (it.next()) |entry| {
+            const leaf = switch (entry.value_ptr.*) {
+                .leaf => |leaf| leaf,
+                else => continue,
+            };
+
+            const cmd = Command.newKeybind(
+                config,
+                entry.key_ptr.*,
+                leaf.action,
+            ) catch |err| {
+                log.warn("failed to build a keybind row: {}", .{err});
+                continue;
+            };
+
+            commands.append(alloc, cmd) catch {
+                cmd.unref();
+                return;
+            };
+        }
+    }
+
     fn collectRegularCommands(
         self: *CommandPalette,
         config: *Config,
@@ -599,6 +644,9 @@ pub const CommandPalette = extern struct {
         // In the plain palette they keep upstream's behaviour and interleave
         // alphabetically with the configured commands, below.
         switch (a.private().data) {
+            // Keybind rows only ever appear alongside other keybind rows, and
+            // fall through to the alphabetical comparison below.
+            .keybind => {},
             .jump => |*ja| switch (b.private().data) {
                 .jump => |*jb| {
                     if (!ja.plain and !jb.plain) {
@@ -607,11 +655,11 @@ pub const CommandPalette = extern struct {
                     }
                 },
                 .regular => if (!ja.plain) return true,
-                .create => unreachable,
+                .create, .keybind => unreachable,
             },
             .regular => switch (b.private().data) {
                 .jump => |*jb| if (!jb.plain) return false,
-                .regular, .create => {},
+                .regular, .create, .keybind => {},
             },
             .create => unreachable,
         }
@@ -882,6 +930,13 @@ pub const CommandPalette = extern struct {
             const surface = cmd.getJumpSurface() orelse return;
             defer surface.unref();
             surface.present();
+            return;
+        }
+
+        // A keybind row is a listing, not something to run. Close, so that
+        // Enter does something rather than appearing dead.
+        if (priv.mode == .keybinds) {
+            self.close();
             return;
         }
 
@@ -1175,6 +1230,21 @@ const Command = extern struct {
             regular: RegularData,
             jump: JumpData,
             create: CreateData,
+            keybind: KeybindData,
+        };
+
+        /// One configured keybinding.
+        pub const KeybindData = struct {
+            /// The action, e.g. `toggle_command_palette`.
+            action_name: [:0]const u8,
+
+            /// The trigger as the config spells it, e.g. `ctrl+shift+p`. The
+            /// filter matches this, which is the point: "what did I bind to
+            /// ctrl+shift+p" is a search for the keys, not for the action.
+            trigger: [:0]const u8,
+
+            /// The same trigger as a GTK accelerator, for the ShortcutLabel.
+            accel: ?[:0]const u8 = null,
         };
 
         /// A synthetic row offering to create a terminal named after whatever
@@ -1245,6 +1315,43 @@ const Command = extern struct {
 
     /// Create the synthetic row that offers to create a terminal named
     /// after the current query.
+    /// A row for one configured keybinding.
+    pub fn newKeybind(
+        config: *Config,
+        trigger: input.Binding.Trigger,
+        action: input.Binding.Action,
+    ) Allocator.Error!*Self {
+        const self = gobject.ext.newInstance(Self, .{ .config = config });
+        errdefer self.unref();
+
+        const priv = self.private();
+        const alloc = priv.arena.allocator();
+
+        // The trigger in the config's own spelling — `ctrl+shift+p` — because
+        // that is what someone types when they are looking for it.
+        const trigger_text = try std.fmt.allocPrintSentinel(
+            alloc,
+            "{f}",
+            .{trigger},
+            0,
+        );
+
+        const accel: ?[:0]const u8 = accel: {
+            var buf: [64]u8 = undefined;
+            const a = (key.accelFromTrigger(&buf, trigger) catch break :accel null) orelse
+                break :accel null;
+            break :accel alloc.dupeZ(u8, a) catch break :accel null;
+        };
+
+        priv.data = .{ .keybind = .{
+            .action_name = try std.fmt.allocPrintSentinel(alloc, "{t}", .{action}, 0),
+            .trigger = trigger_text,
+            .accel = accel,
+        } };
+
+        return self;
+    }
+
     pub fn newCreate(
         config: *Config,
         query: []const u8,
@@ -1299,7 +1406,7 @@ const Command = extern struct {
         }
 
         switch (priv.data) {
-            .regular, .create => {},
+            .regular, .create, .keybind => {},
             .jump => |*j| {
                 j.surface.deinit();
             },
@@ -1329,6 +1436,9 @@ const Command = extern struct {
 
         const regular = switch (priv.data) {
             .regular => |*r| r,
+            // The trigger text, so that searching `ctrl+shift+p` finds the row
+            // bound to it and not only the row whose action is named that.
+            .keybind => |*k| return k.trigger,
             .jump, .create => return null,
         };
 
@@ -1349,6 +1459,7 @@ const Command = extern struct {
 
         const regular = switch (priv.data) {
             .regular => |*r| r,
+            .keybind => |*k| return k.accel,
             .jump, .create => return null,
         };
 
@@ -1412,6 +1523,7 @@ const Command = extern struct {
 
         switch (priv.data) {
             .regular => |*r| return r.command.title,
+            .keybind => |*k| return k.action_name,
             .create => |*c| {
                 if (c.title) |t| return t;
 
@@ -1460,7 +1572,7 @@ const Command = extern struct {
         const priv = self.private();
 
         switch (priv.data) {
-            .regular, .create => return null,
+            .regular, .create, .keybind => return null,
             .jump => |*j| {
                 self.parseJumpTitle(j);
                 return j.project;
@@ -1484,6 +1596,7 @@ const Command = extern struct {
 
         switch (priv.data) {
             .regular => return self.propGetActionKey(),
+            .keybind => |*k| return k.trigger,
             .create => |*c| return c.subtitle,
             .jump => |*j| {
                 if (j.subtitle) |v| return v;
@@ -1503,7 +1616,7 @@ const Command = extern struct {
 
         switch (priv.data) {
             .regular => |*r| return r.command.description,
-            .create => return null,
+            .create, .keybind => return null,
             .jump => |*j| {
                 if (j.description) |desc| return desc;
 
@@ -1534,7 +1647,7 @@ const Command = extern struct {
         const priv = self.private();
         return switch (priv.data) {
             .regular => |*r| r.command.action,
-            .jump, .create => null,
+            .jump, .create, .keybind => null,
         };
     }
 
@@ -1558,7 +1671,7 @@ const Command = extern struct {
     pub fn invalidateTitle(self: *Self) void {
         const priv = self.private();
         switch (priv.data) {
-            .regular, .create => return,
+            .regular, .create, .keybind => return,
             .jump => |*j| {
                 j.title = null;
                 j.project = null;
@@ -1589,7 +1702,7 @@ const Command = extern struct {
     pub fn getJumpSurface(self: *Self) ?*Surface {
         const priv = self.private();
         return switch (priv.data) {
-            .regular, .create => null,
+            .regular, .create, .keybind => null,
             .jump => |*j| j.surface.get(),
         };
     }

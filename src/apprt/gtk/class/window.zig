@@ -399,6 +399,7 @@ pub const Window = extern struct {
             // TODO: accept the surface that toggled the command palette
             .init("toggle-command-palette", actionToggleCommandPalette, null),
             .init("toggle-session-search", actionToggleSessionSearch, null),
+            .init("toggle-keybind-search", actionToggleKeybindSearch, null),
             .init("toggle-inspector", actionToggleInspector, null),
         };
 
@@ -2584,6 +2585,14 @@ pub const Window = extern struct {
         self: *Window,
     ) callconv(.c) void {
         self.toggleCommandPalette(.jump);
+    }
+
+    fn actionToggleKeybindSearch(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        self.toggleCommandPalette(.keybinds);
     }
 
     /// Toggle the Ghostty inspector for the active surface.

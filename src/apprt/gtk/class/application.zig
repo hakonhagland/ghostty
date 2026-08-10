@@ -791,6 +791,7 @@ pub const Application = extern struct {
             .toggle_window_decorations => return Action.toggleWindowDecorations(target),
             .toggle_command_palette => return Action.toggleCommandPalette(target),
             .toggle_session_search => return Action.toggleSessionSearch(target),
+            .toggle_keybind_search => return Action.toggleKeybindSearch(target),
             .toggle_split_zoom => return Action.toggleSplitZoom(target),
             .show_on_screen_keyboard => return Action.showOnScreenKeyboard(target),
             .command_finished => return Action.commandFinished(target, value),
@@ -1235,6 +1236,7 @@ pub const Application = extern struct {
         self.syncActionAccelerator("app.show-gtk-inspector", .show_gtk_inspector);
         self.syncActionAccelerator("win.toggle-command-palette", .toggle_command_palette);
         self.syncActionAccelerator("win.toggle-session-search", .toggle_session_search);
+        self.syncActionAccelerator("win.toggle-keybind-search", .toggle_keybind_search);
         self.syncActionAccelerator("win.close", .{ .close_window = {} });
         self.syncActionAccelerator("win.new-window", .{ .new_window = {} });
         self.syncActionAccelerator("win.new-tab", .{ .new_tab = {} });
@@ -3340,6 +3342,15 @@ const Action = struct {
             .app => return false,
             .surface => |surface| {
                 return surface.rt_surface.gobj().toggleSessionSearch();
+            },
+        }
+    }
+
+    pub fn toggleKeybindSearch(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |surface| {
+                return surface.rt_surface.gobj().toggleKeybindSearch();
             },
         }
     }
