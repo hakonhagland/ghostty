@@ -826,6 +826,16 @@ pub const Action = union(enum) {
     /// version can be found by running `ghostty +version`.
     toggle_session_search,
 
+    /// Open the command palette showing the configured keybindings, so that
+    /// they can be searched by action *or* by the keys themselves.
+    ///
+    /// `ghostty +list-keybinds` prints the same information, but only from a
+    /// terminal and only for the config files it loads by default. This is the
+    /// in-application answer to "what did I bind that to".
+    ///
+    /// This requires libadwaita 1.5 or newer on Linux.
+    toggle_keybind_search,
+
     /// Toggle the quick terminal.
     ///
     /// The quick terminal, also known as the "Quake-style" or drop-down
@@ -1443,6 +1453,7 @@ pub const Action = union(enum) {
             .toggle_mouse_reporting,
             .toggle_command_palette,
             .toggle_session_search,
+            .toggle_keybind_search,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
             .reset_window_size,

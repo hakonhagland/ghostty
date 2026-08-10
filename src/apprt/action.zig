@@ -121,6 +121,7 @@ pub const Action = union(Key) {
     /// Toggle the session search: the command palette showing only the
     /// open terminals.
     toggle_session_search,
+    toggle_keybind_search,
 
     /// Toggle the visibility of all Ghostty terminal windows.
     toggle_visibility,
@@ -376,6 +377,7 @@ pub const Action = union(Key) {
         toggle_quick_terminal,
         toggle_command_palette,
         toggle_session_search,
+        toggle_keybind_search,
         toggle_visibility,
         toggle_background_opacity,
         move_tab,

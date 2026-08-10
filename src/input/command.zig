@@ -637,6 +637,15 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Close all windows."),
         }},
 
+        // Unlike toggle_session_search, this one gets a command: browsing your
+        // keybindings from the palette is a reasonable thing to want, whereas
+        // opening the palette from the palette is not.
+        .toggle_keybind_search => comptime &.{.{
+            .action = .toggle_keybind_search,
+            .title = i18n.N_("Browse Keybindings"),
+            .description = i18n.N_("Search the configured keybindings by action or by key."),
+        }},
+
         .toggle_maximize => comptime &.{.{
             .action = .toggle_maximize,
             .title = i18n.N_("Toggle Maximize"),
