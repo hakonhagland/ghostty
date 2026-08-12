@@ -602,6 +602,68 @@ pub const Window = extern struct {
         }
     }
 
+    /// Recreate a tab from saved state.
+    ///
+    /// This differs from `newTabWith` in one important way: the working
+    /// directory is given explicitly rather than derived from the project.
+    /// When restoring we want the directory the tab was actually in, which is
+    /// not necessarily the one the project's most recently used tab was in.
+    ///
+    /// There is deliberately no parent surface. A restored tab inherits
+    /// nothing from whatever else is on screen; every value it has comes from
+    /// the file.
+    pub fn restoreTab(self: *Self, saved: struct {
+        working_directory: ?[:0]const u8 = null,
+        title: ?[:0]const u8 = null,
+        project: ?[:0]const u8 = null,
+    }) void {
+        const page = self.newTabPage(
+            null,
+            .tab,
+            .{ .working_directory = saved.working_directory },
+        );
+        const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
+
+        if (saved.project) |p| tab.setProject(p);
+        if (saved.title) |t| tab.setTitleOverride(t);
+    }
+
+    /// Select the tab at `index`, counting from zero. Out-of-range indices are
+    /// ignored, so a state file that disagrees with what was actually restored
+    /// simply leaves the first tab selected.
+    pub fn selectTabIndex(self: *Self, index: usize) void {
+        const tab_view = self.private().tab_view;
+        const n = tab_view.getNPages();
+        assert(n >= 0);
+        if (index >= @as(usize, @intCast(n))) return;
+        tab_view.setSelectedPage(tab_view.getNthPage(@intCast(index)));
+    }
+
+    /// The number of tabs in this window.
+    pub fn getTabCount(self: *Self) usize {
+        const n = self.private().tab_view.getNPages();
+        assert(n >= 0);
+        return @intCast(n);
+    }
+
+    /// The tab at `index`, counting from zero, or null if there is none.
+    pub fn getTabAt(self: *Self, index: usize) ?*Tab {
+        const tab_view = self.private().tab_view;
+        const n = tab_view.getNPages();
+        assert(n >= 0);
+        if (index >= @as(usize, @intCast(n))) return null;
+        return gobject.ext.cast(Tab, tab_view.getNthPage(@intCast(index)).getChild());
+    }
+
+    /// The index of the currently selected tab, or null if there is none.
+    pub fn getSelectedTabIndex(self: *Self) ?usize {
+        const tab_view = self.private().tab_view;
+        const page = tab_view.getSelectedPage() orelse return null;
+        const pos = tab_view.getPagePosition(page);
+        if (pos < 0) return null;
+        return @intCast(pos);
+    }
+
     pub fn newTabForWindow(
         self: *Self,
         parent_: ?*CoreSurface,

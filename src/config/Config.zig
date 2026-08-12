@@ -2295,6 +2295,53 @@ keybind: Keybinds = .{},
 /// This is currently only supported on macOS. This has no effect on Linux.
 @"window-save-state": WindowSaveState = .default,
 
+/// Save the arrangement of windows and tabs to a file so that a later launch
+/// can put it back. Linux only; on macOS use `window-save-state` instead,
+/// which hands the same job to the operating system.
+///
+/// The file is `ui-state.json` in Ghostty's state directory, which is
+/// `$XDG_STATE_HOME/ghostty` — usually `~/.local/state/ghostty`. It is a
+/// readable JSON file that you can inspect, edit or copy.
+///
+/// What is saved, for each window: its size, which tab was selected, and for
+/// each tab its working directory, the title you gave it by hand, and its
+/// project. What is *not* saved: the window's position (an application is not
+/// permitted to place its own windows under Wayland), the splits inside a tab,
+/// the contents of the terminal, and whatever program was running in it. A
+/// restored tab is a fresh shell that happens to start in the right place.
+///
+/// Saving the working directory needs shell integration, because the shell is
+/// what tells Ghostty which directory it is in. See `shell-integration`. A tab
+/// whose directory is unknown is restored in the default directory instead.
+///
+/// The state is written whenever a window closes and once more when Ghostty
+/// exits. A state with no windows in it is never written, so quitting with
+/// everything already closed leaves the previous state intact rather than
+/// erasing it.
+///
+/// This does nothing on its own — it only writes the file. Use
+/// `load-ui-state` to read it back.
+@"save-ui-state": bool = false,
+
+/// Restore the windows and tabs saved by `save-ui-state` instead of opening a
+/// single empty window. Linux only.
+///
+/// Typically given on the command line for the launch you want restored:
+///
+/// ```
+/// ghostty --load-ui-state
+/// ```
+///
+/// If there is no state file, or it cannot be read, Ghostty starts normally
+/// with one empty window. The file is not deleted after being read, so the
+/// same state can be restored again.
+///
+/// Note that this only has an effect on the launch that actually starts
+/// Ghostty. If an instance is already running and `gtk-single-instance` is on,
+/// a second `ghostty --load-ui-state` just asks the running instance to open a
+/// window and the flag is ignored.
+@"load-ui-state": bool = false,
+
 /// Resize the window in discrete increments of the focused surface's cell size.
 /// If this is disabled, surfaces are resized in pixel increments. Currently
 /// only supported on macOS.
