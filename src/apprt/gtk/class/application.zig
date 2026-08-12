@@ -30,6 +30,7 @@ const CoreSurface = @import("../../../Surface.zig");
 
 const ext = @import("../ext.zig");
 const key = @import("../key.zig");
+const session = @import("../session.zig");
 const adw_version = @import("../adw_version.zig");
 const gtk_version = @import("../gtk_version.zig");
 const winprotopkg = @import("../winproto.zig");
@@ -229,6 +230,26 @@ pub const Application = extern struct {
         saved_language: ?[:0]const u8 = null,
 
         open_uri: OpenURI = undefined,
+
+        /// The pending idle callback that will write the UI state file, or
+        /// null when no write is pending. Several things can ask for a save in
+        /// quick succession; funnelling them through one idle source means the
+        /// file is written once, after the dust settles, rather than once per
+        /// request.
+        ui_state_source: ?c_uint = null,
+
+        /// Set once we have begun tearing the application down. From that
+        /// point on the window list is being emptied one window at a time, and
+        /// any state collected from it would describe a session that is
+        /// half-closed rather than the one the user had. All further save
+        /// requests are refused.
+        ui_state_closing: bool = false,
+
+        /// Set once we have attempted to restore a saved session, so that a
+        /// second activation (which is what a `ghostty` launched while another
+        /// instance is already running turns into) opens a normal window
+        /// instead of restoring the same session all over again.
+        ui_state_restored: bool = false,
 
         // The audio bell's MediaFile, reused across bells so we don't leak a
         // GStreamer pipeline (and its GL threads) on every ring. Built lazily
@@ -657,6 +678,19 @@ pub const Application = extern struct {
     }
 
     fn quitNow(self: *Self) void {
+        // Save the arrangement before anything is torn down. This is the
+        // last moment at which the window list still describes the session
+        // the user had; one line further down it starts emptying.
+        {
+            const priv = self.private();
+            if (priv.ui_state_source) |source| {
+                _ = glib.Source.remove(source);
+                priv.ui_state_source = null;
+            }
+            self.saveUiState();
+            priv.ui_state_closing = true;
+        }
+
         // Get all our windows and destroy them, forcing them to free.
         const list = gtk.Window.listToplevels();
         defer list.free();
@@ -857,6 +891,220 @@ pub const Application = extern struct {
     /// Returns the app winproto implementation.
     pub fn winproto(self: *Self) *winprotopkg.App {
         return &self.private().winproto;
+    }
+
+    //---------------------------------------------------------------
+    // Saving and restoring the UI state
+    //
+    // See `../session.zig` for the file format and for what is deliberately
+    // not saved. Everything here is the part that has to touch real widgets.
+
+    /// Ask for the UI state to be written, soon but not right now.
+    ///
+    /// Coalesced through an idle callback, because the events that make the
+    /// state stale arrive in bursts — closing a window with several tabs, for
+    /// example — and each of them individually would otherwise cost a
+    /// serialization and a file write.
+    fn scheduleUiStateSave(self: *Self) void {
+        const priv = self.private();
+        if (priv.ui_state_closing) return;
+        if (!priv.config.get().@"save-ui-state") return;
+        if (priv.ui_state_source != null) return;
+        priv.ui_state_source = glib.idleAdd(uiStateIdle, self);
+    }
+
+    fn uiStateIdle(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        self.private().ui_state_source = null;
+        self.saveUiState();
+        return 0; // remove the source
+    }
+
+    /// Write the UI state now, if the configuration asks for it.
+    ///
+    /// Errors are logged and swallowed. Failing to save a session is a
+    /// disappointment; it is never a reason to interfere with what the user
+    /// asked Ghostty to do.
+    fn saveUiState(self: *Self) void {
+        const priv = self.private();
+        if (!priv.config.get().@"save-ui-state") return;
+
+        const alloc = self.allocator();
+
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+
+        const state = self.collectUiState(arena.allocator()) catch |err| {
+            log.warn("unable to collect ui state err={}", .{err});
+            return;
+        };
+
+        // Never replace a good file with an empty one. Quitting when every
+        // window is already closed would otherwise erase the session that was
+        // there a moment ago, which is exactly the state the user most likely
+        // wanted back.
+        if (state.isEmpty()) {
+            log.debug("no windows open, leaving the saved ui state alone", .{});
+            return;
+        }
+
+        session.save(alloc, state) catch |err| {
+            log.warn("unable to save ui state err={}", .{err});
+        };
+    }
+
+    /// Walk the live windows and build the value we serialize.
+    ///
+    /// Everything returned is allocated from `alloc`, which the caller is
+    /// expected to make an arena so that nothing here has to be freed
+    /// individually.
+    fn collectUiState(self: *Self, alloc: Allocator) !session.State {
+        var windows: std.ArrayList(session.State.Window) = .empty;
+
+        // `getWindows` is in most-recently-focused order, which is the reverse
+        // of the order the windows were opened in. Walking it backwards means
+        // the file lists them oldest first, and restoring in file order then
+        // re-creates them in roughly the order they were created.
+        const list: ?*glib.List = self.as(gtk.Application).getWindows();
+        var it: ?*glib.List = list;
+        while (it) |node| : (it = node.f_next) {
+            const ptr = node.f_data orelse continue;
+            const gtk_window: *gtk.Window = @ptrCast(@alignCast(ptr));
+            const window = gobject.ext.cast(Window, gtk_window) orelse continue;
+
+            // The quick terminal is a scratch window summoned by a key press,
+            // not part of the arrangement the user built. Restoring it would
+            // pop up a window nobody asked for.
+            if (window.isQuickTerminal()) continue;
+
+            var tabs: std.ArrayList(session.State.Tab) = .empty;
+            for (0..window.getTabCount()) |i| {
+                const tab = window.getTabAt(i) orelse continue;
+                try tabs.append(alloc, .{
+                    .working_directory = wd: {
+                        const surface = tab.getActiveSurface() orelse break :wd null;
+                        const pwd = surface.getPwd() orelse break :wd null;
+                        if (pwd.len == 0) break :wd null;
+                        break :wd try alloc.dupe(u8, pwd);
+                    },
+                    .title = if (tab.getTitleOverride()) |t|
+                        try alloc.dupe(u8, t)
+                    else
+                        null,
+                    .project = if (tab.getProject()) |p|
+                        try alloc.dupe(u8, p)
+                    else
+                        null,
+                });
+            }
+
+            // A window with no tabs is on its way out; there is nothing in it
+            // worth putting back.
+            if (tabs.items.len == 0) continue;
+
+            var width: c_int = 0;
+            var height: c_int = 0;
+            gtk_window.getDefaultSize(&width, &height);
+
+            try windows.insert(alloc, 0, .{
+                .width = if (width > 0) @intCast(width) else null,
+                .height = if (height > 0) @intCast(height) else null,
+                .focused_tab = window.getSelectedTabIndex(),
+                .tabs = tabs.items,
+            });
+        }
+
+        return .{ .windows = windows.items };
+    }
+
+    /// Recreate the saved windows and tabs.
+    ///
+    /// Returns true if at least one window was created, in which case the
+    /// caller must not also open the usual empty window. Returns false for
+    /// every "there is nothing to restore" case, including a state file that
+    /// is missing, unreadable or empty.
+    fn restoreUiState(self: *Self) bool {
+        const priv = self.private();
+        if (priv.ui_state_restored) return false;
+        if (!priv.config.get().@"load-ui-state") return false;
+        priv.ui_state_restored = true;
+
+        const alloc = self.allocator();
+        var parsed = session.load(alloc) orelse return false;
+        defer parsed.deinit();
+
+        var restored: usize = 0;
+        for (parsed.value.windows) |saved| {
+            if (saved.tabs.len == 0) continue;
+            self.restoreWindow(saved) catch |err| {
+                log.warn("unable to restore a window err={}", .{err});
+                continue;
+            };
+            restored += 1;
+        }
+
+        if (restored == 0) return false;
+
+        log.info("restored ui state windows={d}", .{restored});
+        return true;
+    }
+
+    fn restoreWindow(self: *Self, saved: session.State.Window) !void {
+        const alloc = self.allocator();
+        const priv = self.private();
+
+        // Same bookkeeping `newWindow` does: without this the run loop can
+        // decide there are no windows and quit before the first one appears.
+        priv.requested_window = true;
+
+        const win = Window.new(self, .{});
+        _ = gobject.Object.bindProperty(
+            self.as(gobject.Object),
+            "config",
+            win.as(gobject.Object),
+            "config",
+            .{},
+        );
+
+        // The saved size has to be applied before the window is presented,
+        // otherwise it is briefly shown at the default size and then jumps.
+        if (saved.width) |w| {
+            if (saved.height) |h| {
+                if (w > 0 and h > 0) {
+                    win.as(gtk.Window).setDefaultSize(@intCast(w), @intCast(h));
+                }
+            }
+        }
+
+        for (saved.tabs) |tab| {
+            // Every string in the state file is a plain slice, but the GTK
+            // side wants null-terminated ones, so each has to be copied.
+            const wd = try dupeOptZ(alloc, tab.working_directory);
+            defer if (wd) |v| alloc.free(v);
+            const title = try dupeOptZ(alloc, tab.title);
+            defer if (title) |v| alloc.free(v);
+            const project = try dupeOptZ(alloc, tab.project);
+            defer if (project) |v| alloc.free(v);
+
+            win.restoreTab(.{
+                .working_directory = wd,
+                .title = title,
+                .project = project,
+            });
+        }
+
+        if (saved.focused_tab) |i| win.selectTabIndex(i);
+
+        gtk.Window.present(win.as(gtk.Window));
+    }
+
+    /// Copy an optional slice into an optional null-terminated one, treating
+    /// the empty string as "not set" so that a hand-edited state file with
+    /// `"title": ""` in it does not produce a tab with a blank forced title.
+    fn dupeOptZ(alloc: Allocator, v_: ?[]const u8) !?[:0]const u8 {
+        const v = v_ orelse return null;
+        if (v.len == 0) return null;
+        return try alloc.dupeZ(u8, v);
     }
 
     /// Returns the open URI portal implementation.
@@ -1566,17 +1814,42 @@ pub const Application = extern struct {
     fn activate(self: *Self) callconv(.c) void {
         log.debug("activate", .{});
 
-        // Queue a new window
         const priv = self.private();
-        _ = priv.core_app.mailbox.push(global.io(), .{
-            .new_window = .{},
-        }, .{ .forever = {} });
+
+        // A restored session replaces the empty window we would otherwise
+        // open. If there is nothing to restore we fall through and behave
+        // exactly as before.
+        if (!self.restoreUiState()) {
+            // Queue a new window
+            _ = priv.core_app.mailbox.push(global.io(), .{
+                .new_window = .{},
+            }, .{ .forever = {} });
+        }
 
         // Call the parent activate method.
         gio.Application.virtual_methods.activate.call(
             Class.parent,
             self.as(Parent),
         );
+    }
+
+    /// A window has left the application, usually because it was closed.
+    ///
+    /// The window is already off the list by the time this runs, so a save
+    /// scheduled here records what is left — which is the point: closing a
+    /// window is the user telling us that window is no longer part of the
+    /// session.
+    fn windowRemoved(
+        self: *Self,
+        window: *gtk.Window,
+    ) callconv(.c) void {
+        gtk.Application.virtual_methods.window_removed.call(
+            Class.parent,
+            self.as(Parent),
+            window,
+        );
+
+        self.scheduleUiStateSave();
     }
 
     fn dispose(self: *Self) callconv(.c) void {
@@ -1591,6 +1864,10 @@ pub const Application = extern struct {
                 log.warn("unable to remove signal source", .{});
             }
             priv.signal_source = null;
+        }
+        if (priv.ui_state_source) |v| {
+            _ = glib.Source.remove(v);
+            priv.ui_state_source = null;
         }
 
         if (priv.bell_media) |v| {
@@ -2232,6 +2509,7 @@ pub const Application = extern struct {
             // Virtual methods
             gio.Application.virtual_methods.activate.implement(class, &activate);
             gio.Application.virtual_methods.startup.implement(class, &startup);
+            gtk.Application.virtual_methods.window_removed.implement(class, &windowRemoved);
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);
             gobject.Object.virtual_methods.finalize.implement(class, &finalize);
         }
