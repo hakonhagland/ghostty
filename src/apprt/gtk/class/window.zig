@@ -28,8 +28,8 @@ const Surface = @import("surface.zig").Surface;
 const Tab = @import("tab.zig").Tab;
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
-const WeakRef = @import("../weak_ref.zig").WeakRef;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
+const WeakRef = @import("../weak_ref.zig").WeakRef;
 
 const log = std.log.scoped(.gtk_ghostty_window);
 
@@ -129,6 +129,38 @@ pub const Window = extern struct {
                     .accessor = gobject.ext.typedAccessor(Self, bool, .{
                         .getter = Self.getHeaderbarVisible,
                     }),
+                },
+            );
+        };
+
+        /// The name the user gave this window. Purely a user-assigned label,
+        /// exactly like a tab's project: nothing derives it and nothing else
+        /// depends on it.
+        pub const @"window-name" = struct {
+            pub const name = "window-name";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = C.privateStringFieldAccessor("window_name"),
+                },
+            );
+        };
+
+        /// The selected tab's title, written here by the tab binding group.
+        /// Not meant for anyone outside this class; it exists so that the
+        /// window title can be composed from it and the window name.
+        pub const @"tab-title" = struct {
+            pub const name = "tab-title";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = C.privateStringFieldAccessor("tab_title"),
                 },
             );
         };
@@ -245,6 +277,23 @@ pub const Window = extern struct {
         /// Binding group for our active tab.
         tab_bindings: *gobject.BindingGroup,
 
+        /// The name the user gave this window, if any.
+        ///
+        /// A window otherwise has no identity of its own — its title is
+        /// whatever the selected tab's title is — so there is nothing to say
+        /// about it in the switcher and nothing to put back when a session is
+        /// restored. This is that missing identity, and it is to a window what
+        /// `project` is to a tab.
+        window_name: ?[:0]const u8 = null,
+
+        /// The title of the currently selected tab, which the tab binding
+        /// group writes here rather than straight onto the window.
+        ///
+        /// It used to be bound directly to the window's own title. It has to
+        /// pass through here now so that the window name can be composed in
+        /// front of it; see `syncWindowTitle`.
+        tab_title: ?[:0]const u8 = null,
+
         /// The configuration that this surface is using.
         config: ?*Config = null,
 
@@ -340,7 +389,19 @@ pub const Window = extern struct {
         // Setup our tab binding group. This ensures certain properties
         // are only synced from the currently active tab.
         priv.tab_bindings = gobject.BindingGroup.new();
-        priv.tab_bindings.bind("title", self.as(gobject.Object), "title", .{});
+
+        // Bound to our own `tab-title` rather than straight onto the window's
+        // title, so that `syncWindowTitle` can put the window name in front of
+        // it. Binding both this and the name to the real title would have them
+        // overwrite each other.
+        priv.tab_bindings.bind("title", self.as(gobject.Object), "tab-title", .{});
+        _ = gobject.Object.signals.notify.connect(
+            self,
+            *Self,
+            propTabTitle,
+            self,
+            .{ .detail = "tab-title" },
+        );
 
         // Set our window icon. We can't set this in the blueprint file
         // because its dependent on the build config.
@@ -385,6 +446,7 @@ pub const Window = extern struct {
             .init("new-window", actionNewWindow, null),
             .init("prompt-surface-title", actionPromptSurfaceTitle, null),
             .init("prompt-tab-title", actionPromptTabTitle, null),
+            .init("prompt-window-name", actionPromptWindowName, null),
             .init("prompt-context-tab-title", actionPromptContextTabTitle, null),
             .init("prompt-window-title", actionPromptWindowTitle, null),
             .init("ring-bell", actionRingBell, null),
@@ -441,10 +503,27 @@ pub const Window = extern struct {
     ///
     /// Split out from `newTabTitled` so that the session search can show the
     /// directory a new terminal will start in before you commit to creating it.
-    /// Split text the user typed into the switcher into a project and the rest.
+    /// What the user typed into the switcher, taken apart.
+    pub const Query = struct {
+        /// The project named by `@name`, if any.
+        project: ?[]const u8 = null,
+
+        /// The window named by `%name`, if any.
+        window: ?[]const u8 = null,
+
+        /// Everything that is not a sigil token: ordinary search text.
+        rest: []const u8 = "",
+    };
+
+    /// Split text the user typed into the switcher into its sigil tokens and
+    /// the rest.
     ///
-    /// `@project rest` — a leading `@`, then a project name terminated by a
-    /// space. Anything else is all "rest" and names no project.
+    /// Two sigils, each introducing one token terminated by a space:
+    /// `@project` narrows to a project, `%window` narrows to a named window.
+    /// They may appear in either order and either may be left out, so
+    /// `%left @web log` and `@web %left log` mean the same thing and both
+    /// search for "log". The first token that does not begin with a sigil ends
+    /// the sigil section; everything from there on is ordinary text.
     ///
     /// The separator is a space rather than the `:` this used to use, and that
     /// matters for searching as much as creating. With `project:name` there was
@@ -454,24 +533,141 @@ pub const Window = extern struct {
     /// narrowing further.
     ///
     /// It also retires a hazard rather than guarding against one. Only the
-    /// first character is significant, so a colon anywhere in a path or a
-    /// running command cannot be mistaken for a separator.
-    pub fn parseQuery(typed: []const u8) struct { ?[]const u8, []const u8 } {
-        const trimmed = std.mem.trim(u8, typed, " ");
-        if (trimmed.len == 0 or trimmed[0] != '@') return .{ null, typed };
+    /// first character of a token is significant, so a colon anywhere in a path
+    /// or a running command cannot be mistaken for a separator.
+    pub fn parseQuery(typed: []const u8) Query {
+        var result: Query = .{ .rest = typed };
+        var remaining = std.mem.trim(u8, typed, " ");
 
-        const rest = trimmed[1..];
+        while (remaining.len > 0) {
+            const sigil = remaining[0];
+            if (sigil != '@' and sigil != '%') break;
 
-        // A bare `@` names no project *yet*. Treating it as a filter would make
-        // every row vanish the instant the sigil is typed, which is the worst
-        // possible moment: it reads as "there is nothing here" exactly when the
-        // user has committed to narrowing and has not yet said to what. An
-        // empty query shows everything, so a bare sigil should too.
-        if (rest.len == 0) return .{ null, "" };
+            const after = remaining[1..];
+            const end = std.mem.indexOfScalar(u8, after, ' ') orelse after.len;
+            const token = after[0..end];
 
-        const idx = std.mem.indexOfScalar(u8, rest, ' ') orelse
-            return .{ rest, "" };
-        return .{ rest[0..idx], std.mem.trim(u8, rest[idx + 1 ..], " ") };
+            // A bare sigil names nothing *yet*. Treating it as a filter would
+            // make every row vanish the instant the sigil is typed, which is
+            // the worst possible moment: it reads as "there is nothing here"
+            // exactly when the user has committed to narrowing and has not yet
+            // said to what. An empty query shows everything, so a bare sigil
+            // should too.
+            if (token.len > 0) switch (sigil) {
+                '@' => result.project = token,
+                '%' => result.window = token,
+                else => unreachable,
+            };
+
+            remaining = std.mem.trimStart(u8, after[end..], " ");
+            result.rest = remaining;
+        }
+
+        return result;
+    }
+
+    /// The name the user gave this window, or null if they have not named it.
+    pub fn getWindowName(self: *Self) ?[:0]const u8 {
+        return self.private().window_name;
+    }
+
+    /// Name this window, or clear the name with null or an empty string.
+    pub fn setWindowName(self: *Self, name_: ?[:0]const u8) void {
+        const priv = self.private();
+
+        if (priv.window_name) |v| glib.free(@ptrCast(@constCast(v)));
+        priv.window_name = null;
+
+        if (name_) |v| {
+            if (v.len > 0) priv.window_name = glib.ext.dupeZ(u8, v);
+        }
+
+        self.as(gobject.Object).notifyByPspec(
+            properties.@"window-name".impl.param_spec,
+        );
+        self.syncWindowTitle();
+    }
+
+    fn propTabTitle(
+        _: *Self,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        self.syncWindowTitle();
+    }
+
+    /// Set the real window title from the window name and the selected tab's
+    /// title: `[name] tab title`, or just the tab title when unnamed.
+    ///
+    /// The bracketed prefix is the same shape a tab uses for its project, so
+    /// the two read as one convention rather than two. It is deliberately in
+    /// the window title and not in the tab bar: the tab bar is already the
+    /// most crowded place in the window, and the window title is the one piece
+    /// of text that belongs to the window rather than to anything inside it.
+    fn syncWindowTitle(self: *Self) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        const composed = composeTitle(
+            alloc,
+            priv.window_name,
+            priv.tab_title orelse "",
+        ) catch return;
+        defer if (composed) |v| alloc.free(v);
+
+        self.as(gtk.Window).setTitle(if (composed) |v| v.ptr else null);
+    }
+
+    /// Build the window title from the window's name and the selected tab's
+    /// title. Null means "we have nothing to say", and GTK falls back to its
+    /// own default.
+    ///
+    /// Split out from `syncWindowTitle` so the composition can be tested
+    /// without a window, a display, or a running application.
+    fn composeTitle(
+        alloc: std.mem.Allocator,
+        name_: ?[]const u8,
+        tab_title: []const u8,
+    ) !?[:0]const u8 {
+        const name = name_ orelse {
+            if (tab_title.len == 0) return null;
+            return try alloc.dupeZ(u8, tab_title);
+        };
+
+        // A named window with nothing in it yet is still worth labeling, so
+        // the brackets stand alone rather than being suppressed.
+        if (tab_title.len == 0) {
+            return try std.fmt.allocPrintSentinel(alloc, "[{s}]", .{name}, 0);
+        }
+
+        return try std.fmt.allocPrintSentinel(
+            alloc,
+            "[{s}] {s}",
+            .{ name, tab_title },
+            0,
+        );
+    }
+
+    /// Ask the user to name this window, prefilled with its current name.
+    pub fn promptWindowName(self: *Self) void {
+        const dialog = TitleDialog.new(.window_name, self.private().window_name);
+        _ = TitleDialog.signals.set.connect(
+            dialog,
+            *Self,
+            windowNameDialogSet,
+            self,
+            .{},
+        );
+        dialog.present(self.as(gtk.Widget));
+    }
+
+    fn windowNameDialogSet(
+        _: *TitleDialog,
+        name: [*:0]const u8,
+        self: *Self,
+    ) callconv(.c) void {
+        const value = std.mem.span(name);
+        self.setWindowName(if (value.len > 0) value else null);
     }
 
     /// The project of the tab we are currently in, if it has one.
@@ -515,7 +711,7 @@ pub const Window = extern struct {
         // An explicitly typed project wins; otherwise the new terminal joins
         // the project of the one we are in, which is what makes creating a
         // second terminal in the same project need no typing at all.
-        const project = parseQuery(typed)[0] orelse self.currentProject();
+        const project = parseQuery(typed).project orelse self.currentProject();
         if (project) |p| {
             if (projectCwd(p)) |cwd| return cwd;
         }
@@ -575,7 +771,9 @@ pub const Window = extern struct {
     pub fn newTabTitled(self: *Self, typed: [:0]const u8) void {
         const parent = if (self.getActiveSurface()) |v| v.core() else null;
 
-        const typed_project, const name = parseQuery(typed);
+        const query = parseQuery(typed);
+        const typed_project = query.project;
+        const name = query.rest;
         const inherited = if (typed_project == null) self.currentProject() else null;
 
         const alloc = Application.default().allocator();
@@ -2502,6 +2700,14 @@ pub const Window = extern struct {
         self.performBindingAction(.prompt_window_title);
     }
 
+    fn actionPromptWindowName(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        self.promptWindowName();
+    }
+
     fn actionSplitRight(
         _: *gio.SimpleAction,
         _: ?*glib.Variant,
@@ -2728,6 +2934,8 @@ pub const Window = extern struct {
                 properties.debug.impl,
                 properties.@"headerbar-visible".impl,
                 properties.@"quick-terminal".impl,
+                properties.@"window-name".impl,
+                properties.@"tab-title".impl,
                 properties.@"tabs-autohide".impl,
                 properties.@"tabs-visible".impl,
                 properties.@"tabs-wide".impl,
@@ -2783,32 +2991,96 @@ test "parseQuery" {
     const P = Window.parseQuery;
 
     // No sigil: everything is "rest", untouched.
-    try testing.expectEqual(@as(?[]const u8, null), P("download")[0]);
-    try testing.expectEqualStrings("download", P("download")[1]);
+    try testing.expectEqual(@as(?[]const u8, null), P("download").project);
+    try testing.expectEqualStrings("download", P("download").rest);
 
     // A colon is just a character now, which is the point of the change.
-    try testing.expectEqual(@as(?[]const u8, null), P("http://x:8080")[0]);
-    try testing.expectEqualStrings("http://x:8080", P("http://x:8080")[1]);
+    try testing.expectEqual(@as(?[]const u8, null), P("http://x:8080").project);
+    try testing.expectEqualStrings("http://x:8080", P("http://x:8080").rest);
 
     // Sigil alone, and partial names, so narrowing works while typing.
-    try testing.expectEqualStrings("f", P("@f")[0].?);
-    try testing.expectEqualStrings("fo", P("@fo")[0].?);
-    try testing.expectEqualStrings("foo", P("@foo")[0].?);
-    try testing.expectEqualStrings("", P("@foo")[1]);
+    try testing.expectEqualStrings("f", P("@f").project.?);
+    try testing.expectEqualStrings("fo", P("@fo").project.?);
+    try testing.expectEqualStrings("foo", P("@foo").project.?);
+    try testing.expectEqualStrings("", P("@foo").rest);
 
     // Project and rest.
-    try testing.expectEqualStrings("foo", P("@foo download")[0].?);
-    try testing.expectEqualStrings("download", P("@foo download")[1]);
+    try testing.expectEqualStrings("foo", P("@foo download").project.?);
+    try testing.expectEqualStrings("download", P("@foo download").rest);
 
     // Extra spaces collapse; the rest keeps its own internal spaces.
-    try testing.expectEqualStrings("foo", P("  @foo   a b  ")[0].?);
-    try testing.expectEqualStrings("a b", P("  @foo   a b  ")[1]);
+    try testing.expectEqualStrings("foo", P("  @foo   a b  ").project.?);
+    try testing.expectEqualStrings("a b", P("  @foo   a b  ").rest);
 
     // A bare sigil names no project yet, and must behave like an empty query
     // rather than filtering everything away the moment it is typed.
-    try testing.expectEqual(@as(?[]const u8, null), P("@")[0]);
-    try testing.expectEqualStrings("", P("@")[1]);
-    try testing.expectEqual(@as(?[]const u8, null), P("  @  ")[0]);
-    try testing.expectEqualStrings("", P("  @  ")[1]);
-    try testing.expectEqualStrings("", P("")[1]);
+    try testing.expectEqual(@as(?[]const u8, null), P("@").project);
+    try testing.expectEqualStrings("", P("@").rest);
+    try testing.expectEqual(@as(?[]const u8, null), P("  @  ").project);
+    try testing.expectEqualStrings("", P("  @  ").rest);
+    try testing.expectEqualStrings("", P("").rest);
+}
+
+test "parseQuery window sigil" {
+    const testing = std.testing;
+    const P = Window.parseQuery;
+
+    // `%` names a window, exactly as `@` names a project.
+    try testing.expectEqualStrings("left", P("%left").window.?);
+    try testing.expectEqualStrings("", P("%left").rest);
+    try testing.expectEqualStrings("left", P("%left log").window.?);
+    try testing.expectEqualStrings("log", P("%left log").rest);
+    try testing.expectEqual(@as(?[]const u8, null), P("%left").project);
+
+    // A bare `%` narrows nothing yet, same as a bare `@`.
+    try testing.expectEqual(@as(?[]const u8, null), P("%").window);
+    try testing.expectEqualStrings("", P("%").rest);
+
+    // Both sigils, in either order, mean the same thing.
+    for ([_][]const u8{ "%left @web log", "@web %left log" }) |q| {
+        try testing.expectEqualStrings("left", P(q).window.?);
+        try testing.expectEqualStrings("web", P(q).project.?);
+        try testing.expectEqualStrings("log", P(q).rest);
+    }
+
+    // A sigil that is not leading is ordinary text: a stray `%` in a command
+    // line or a path must not be read as a filter.
+    try testing.expectEqual(@as(?[]const u8, null), P("make %.o").window);
+    try testing.expectEqualStrings("make %.o", P("make %.o").rest);
+
+    // The window is not remembered from a previous parse, and an unnamed
+    // window query leaves the project alone.
+    try testing.expectEqual(@as(?[]const u8, null), P("@web log").window);
+}
+
+test "composeTitle" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const C = Window.composeTitle;
+
+    // Unnamed window: the title is exactly the tab's, unchanged.
+    {
+        const got = (try C(alloc, null, "build")).?;
+        defer alloc.free(got);
+        try testing.expectEqualStrings("build", got);
+    }
+
+    // Named window: the name in brackets in front, the same shape a tab uses
+    // for its project.
+    {
+        const got = (try C(alloc, "left", "build")).?;
+        defer alloc.free(got);
+        try testing.expectEqualStrings("[left] build", got);
+    }
+
+    // A named window with no tab title still shows its name.
+    {
+        const got = (try C(alloc, "left", "")).?;
+        defer alloc.free(got);
+        try testing.expectEqualStrings("[left]", got);
+    }
+
+    // Nothing to say at all: let GTK use its own default rather than setting
+    // an empty title.
+    try testing.expectEqual(@as(?[:0]const u8, null), try C(alloc, null, ""));
 }

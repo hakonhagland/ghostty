@@ -222,6 +222,7 @@ pub const Target = enum(c_int) {
     surface,
     tab,
     window,
+    window_name,
     project,
 
     pub fn title(self: Target) [*:0]const u8 {
@@ -229,6 +230,7 @@ pub const Target = enum(c_int) {
             .surface => i18n._("Change Terminal Title"),
             .tab => i18n._("Change Tab Title"),
             .window => i18n._("Change Window Title"),
+            .window_name => i18n._("Name This Window"),
             .project => i18n._("Change Tab Project"),
         };
     }
@@ -238,6 +240,7 @@ pub const Target = enum(c_int) {
     pub fn body(self: Target) [*:0]const u8 {
         return switch (self) {
             .surface, .tab, .window => i18n._("Leave blank to restore the default title."),
+            .window_name => i18n._("Leave blank to remove the name."),
             .project => i18n._("Leave blank to remove the project."),
         };
     }

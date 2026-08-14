@@ -25,9 +25,9 @@ const CoreConfig = @import("../../config.zig").Config;
 
 const log = std.log.scoped(.gtk_session);
 
-/// Where the state file lives, relative to the XDG state directory
-/// (`$XDG_STATE_HOME`, or `~/.local/state` when that is unset).
-/// The default location, used when `ui-state-path` is unset.
+/// The default location, used when `ui-state-path` is unset: `ui-state.json`
+/// inside the XDG state directory (`$XDG_STATE_HOME`, or `~/.local/state` when
+/// that is unset).
 const subdir = "ghostty";
 const filename = "ui-state.json";
 
@@ -50,6 +50,10 @@ pub const State = struct {
 
     /// One window, with its tabs in the order they appeared in the tab bar.
     pub const Window = struct {
+        /// The name the user gave this window, if any. Specific to this fork;
+        /// upstream Ghostty has no notion of a named window.
+        name: ?[]const u8 = null,
+
         /// The window size in pixels, as GTK last reported it. Null means
         /// "we could not measure it", in which case the restored window is
         /// sized the way a brand new window would be.

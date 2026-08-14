@@ -279,6 +279,16 @@ pub const CommandPalette = extern struct {
             return 1;
         }
 
+        if (keyval == gdk.KEY_n or keyval == gdk.KEY_N) {
+            // Names the window the *selected* terminal is in, not the one the
+            // palette happens to be sitting over. Those are usually the same,
+            // but when they are not, the row you are looking at is the one you
+            // mean.
+            const window = self.selectedWindow() orelse return 0;
+            window.promptWindowName();
+            return 1;
+        }
+
         if (keyval == gdk.KEY_p or keyval == gdk.KEY_P) {
             const tab = self.selectedTab() orelse return 0;
             self.watchRename(tab);
@@ -374,6 +384,33 @@ pub const CommandPalette = extern struct {
         return ext.getAncestor(Tab, surface.as(gtk.Widget));
     }
 
+    /// The window owning the currently selected row, if that row is a
+    /// terminal. Falls back to the window the palette was opened over, so that
+    /// naming a window still works when nothing is selected.
+    fn selectedWindow(self: *Self) ?*Window {
+        const priv = self.private();
+
+        selected: {
+            const object = priv.model.as(gio.ListModel).getObject(
+                priv.model.getSelected(),
+            ) orelse break :selected;
+            defer object.unref();
+
+            const cmd = gobject.ext.cast(Command, object) orelse break :selected;
+            const surface = cmd.getJumpSurface() orelse break :selected;
+            defer surface.unref();
+
+            if (ext.getAncestor(Window, surface.as(gtk.Widget))) |w| return w;
+        }
+
+        // The weak reference hands out a strong one, but every other window
+        // here is borrowed, so drop it again immediately. The palette cannot
+        // outlive the window it is presented over.
+        const window = priv.window.get() orelse return null;
+        window.unref();
+        return window;
+    }
+
     /// Move the selection back to the first row.
     ///
     /// The list view is `single-click-activate`, which GTK documents as
@@ -457,7 +494,7 @@ pub const CommandPalette = extern struct {
         // wondering what the box accepts. The footer is already full.
         priv.search.setPlaceholderText(switch (priv.mode) {
             .all => i18n._("Execute a command…"),
-            .jump => i18n._("Switch to a terminal, or @project…"),
+            .jump => i18n._("Switch to a terminal, or @project, or %window…"),
             .keybinds => i18n._("Search keybindings by action or by key…"),
         });
 
@@ -466,7 +503,7 @@ pub const CommandPalette = extern struct {
         const show_hints = priv.mode == .jump;
         priv.hints.as(gtk.Widget).setVisible(@intFromBool(show_hints));
         if (show_hints) priv.hints.setLabel(
-            i18n._("Enter switch · Ctrl+Enter new · Ctrl+Shift+Enter new… · Ctrl+R rename · Ctrl+P project"),
+            i18n._("Enter switch · Ctrl+Enter new · Ctrl+Shift+Enter new… · Ctrl+R rename · Ctrl+P project · Ctrl+N name window"),
         );
 
         // Clear existing binds
@@ -719,18 +756,28 @@ pub const CommandPalette = extern struct {
         const cmd = gobject.ext.cast(Command, item) orelse return 1;
 
         const text = std.mem.span(priv.search.as(gtk.Editable).getText());
-        const project_q, const rest = Window.parseQuery(text);
+        const query = Window.parseQuery(text);
+        const rest = query.rest;
 
         // The create row *is* the query, so it always belongs in the list. It
         // used to stay visible by repeating the query in its own label, which
         // only worked while the filter was a plain substring match.
         if (cmd.isCreate()) return 1;
 
-        if (project_q) |q| {
+        if (query.project) |q| {
             // A project query is only meaningful for terminals.
             if (!cmd.isJump()) return 0;
             const project = cmd.propGetProject() orelse return 0;
             if (!contains(project, q)) return 0;
+        }
+
+        if (query.window) |q| {
+            // Likewise a window query. A terminal in an unnamed window cannot
+            // match one, which is the point: naming a window is how you carve
+            // a subset out of the list.
+            if (!cmd.isJump()) return 0;
+            const window = cmd.getWindowName() orelse return 0;
+            if (!contains(window, q)) return 0;
         }
 
         if (rest.len == 0) return 1;
@@ -787,8 +834,8 @@ pub const CommandPalette = extern struct {
 
         // A bare `@` is a sigil with nothing after it, so there is nothing to
         // create yet. Without this the row reads `Create terminal ""`.
-        const parsed_project, const parsed_name = Window.parseQuery(query);
-        if (parsed_project == null and parsed_name.len == 0) return;
+        const parsed = Window.parseQuery(query);
+        if (parsed.project == null and parsed.window == null and parsed.rest.len == 0) return;
 
         const cwd = if (priv.window.get()) |window| cwd: {
             defer window.unref();
@@ -818,7 +865,9 @@ pub const CommandPalette = extern struct {
         defer window.unref();
 
         const text = std.mem.span(priv.search.as(gtk.Editable).getText());
-        const typed_project, const name = Window.parseQuery(text);
+        const parsed = Window.parseQuery(text);
+        const typed_project = parsed.project;
+        const name = parsed.rest;
 
         // A typed project is a *fragment* being narrowed with — `@f` on the way
         // to `foo`. Prefilling the dialog with `f` would put the fragment into
@@ -1279,6 +1328,12 @@ const Command = extern struct {
             project: ?[:0]const u8 = null,
             parsed: bool = false,
 
+            /// The name of the window this terminal lives in, if the user has
+            /// named it. Copied rather than looked up live, for the same
+            /// reason the surface is held weakly: a palette row must not keep
+            /// a window alive.
+            window: ?[:0]const u8 = null,
+
             /// The working directory, abbreviated for display.
             subtitle: ?[:0]const u8 = null,
 
@@ -1497,6 +1552,9 @@ const Command = extern struct {
         if (tab_) |tab| {
             if (tab.getProject()) |p| j.project = alloc.dupeZ(u8, p) catch null;
         }
+        if (ext.getAncestor(Window, surface.as(gtk.Widget))) |window| {
+            if (window.getWindowName()) |n| j.window = alloc.dupeZ(u8, n) catch null;
+        }
         const override = if (tab_) |tab| tab.getTitleOverride() else null;
 
         const effective_title = surface.getEffectiveTitle() orelse "Untitled";
@@ -1531,7 +1589,9 @@ const Command = extern struct {
                 // label used to echo the raw query so the row kept passing a
                 // plain substring filter; the filter now passes create rows
                 // unconditionally, so the label is free to be useful.
-                const project, const name = Window.parseQuery(c.query);
+                const parsed = Window.parseQuery(c.query);
+                const project = parsed.project;
+                const name = parsed.rest;
                 const alloc = priv.arena.allocator();
                 c.title = title: {
                     if (project) |p| {
@@ -1576,6 +1636,20 @@ const Command = extern struct {
             .jump => |*j| {
                 self.parseJumpTitle(j);
                 return j.project;
+            },
+        }
+    }
+
+    /// The name of the window this terminal is in, if it has one. Used by the
+    /// `%name` filter; not shown in the row.
+    fn getWindowName(self: *Self) ?[:0]const u8 {
+        const priv = self.private();
+
+        switch (priv.data) {
+            .regular, .create, .keybind => return null,
+            .jump => |*j| {
+                self.parseJumpTitle(j);
+                return j.window;
             },
         }
     }
