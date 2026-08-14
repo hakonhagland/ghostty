@@ -1067,6 +1067,10 @@ pub const Application = extern struct {
             gtk_window.getDefaultSize(&width, &height);
 
             try windows.insert(alloc, 0, .{
+                .name = if (window.getWindowName()) |n|
+                    try alloc.dupe(u8, n)
+                else
+                    null,
                 .width = if (width > 0) @intCast(width) else null,
                 .height = if (height > 0) @intCast(height) else null,
                 .focused_tab = window.getSelectedTabIndex(),
@@ -1175,6 +1179,12 @@ pub const Application = extern struct {
             "config",
             .{},
         );
+
+        if (saved.name) |n| {
+            const name = try dupeOptZ(alloc, n);
+            defer if (name) |v| alloc.free(v);
+            win.setWindowName(name);
+        }
 
         // The saved size has to be applied before the window is presented,
         // otherwise it is briefly shown at the default size and then jumps.
