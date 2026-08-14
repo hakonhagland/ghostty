@@ -2157,6 +2157,17 @@ pub const Surface = extern struct {
         return self.private().focus_seq;
     }
 
+    /// Overwrite the focus sequence.
+    ///
+    /// Only session restore has any business calling this. Restoring recreates
+    /// terminals in whatever order the state file lists them, which stamps them
+    /// with sequences in that order; replaying the saved ordering afterwards is
+    /// the only way the switcher can open on the order the user actually left
+    /// behind. Anything else should let `updateFocus` do this.
+    pub fn setFocusSeq(self: *Self, seq: u64) void {
+        self.private().focus_seq = seq;
+    }
+
     /// Returns true if the GLArea of this surface is mapped.
     pub fn getMapped(self: *Self) bool {
         return self.private().mapped;

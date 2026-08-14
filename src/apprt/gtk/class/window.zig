@@ -612,20 +612,32 @@ pub const Window = extern struct {
     /// There is deliberately no parent surface. A restored tab inherits
     /// nothing from whatever else is on screen; every value it has comes from
     /// the file.
+    ///
+    /// Returns the tab so the caller can reach its surface, or null in the
+    /// case that should never happen where the page holds something other
+    /// than a tab.
     pub fn restoreTab(self: *Self, saved: struct {
         working_directory: ?[:0]const u8 = null,
         title: ?[:0]const u8 = null,
         project: ?[:0]const u8 = null,
-    }) void {
+    }) ?*Tab {
         const page = self.newTabPage(
             null,
             .tab,
-            .{ .working_directory = saved.working_directory },
+            .{
+                .working_directory = saved.working_directory,
+
+                // The file's order is the order the user had. Honoring
+                // `window-new-tab-position` here would rewrite it.
+                .append = true,
+            },
         );
-        const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
+        const tab = gobject.ext.cast(Tab, page.getChild()) orelse return null;
 
         if (saved.project) |p| tab.setProject(p);
         if (saved.title) |t| tab.setTitleOverride(t);
+
+        return tab;
     }
 
     /// Select the tab at `index`, counting from zero. Out-of-range indices are
@@ -698,6 +710,14 @@ pub const Window = extern struct {
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
 
+            /// Put the tab at the end of the bar regardless of what
+            /// `window-new-tab-position` says. Session restore needs this: it
+            /// adds tabs in the order the file lists them, and with
+            /// `window-new-tab-position = current` each new tab would be
+            /// inserted straight after the selected one, so a restored window
+            /// would come back with its tabs in reverse.
+            append: bool = false,
+
             pub const none: @This() = .{};
         },
     ) *adw.TabPage {
@@ -737,7 +757,9 @@ pub const Window = extern struct {
             // This should never happen.
             return tab_view.append(tab.as(gtk.Widget));
         };
-        const position = switch (config.@"window-new-tab-position") {
+        const position = if (overrides.append)
+            tab_view.getNPages()
+        else switch (config.@"window-new-tab-position") {
             .current => current: {
                 const selected = tab_view.getSelectedPage() orelse
                     break :current tab_view.getNPages();

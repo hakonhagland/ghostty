@@ -2342,6 +2342,54 @@ keybind: Keybinds = .{},
 /// window and the flag is ignored.
 @"load-ui-state": bool = false,
 
+/// Where the UI state file lives. Linux only.
+///
+/// Defaults to `ui-state.json` in Ghostty's state directory, i.e.
+/// `$XDG_STATE_HOME/ghostty/ui-state.json` — usually
+/// `~/.local/state/ghostty/ui-state.json`. Any missing parent directories are
+/// created when the file is first written.
+///
+/// Two reasons to set this.
+///
+/// **Several builds of Ghostty on one machine.** Each build should have its own
+/// file, or they overwrite each other's session. Because a config file may be
+/// shared between builds, this usually belongs on the command line of whatever
+/// launches each build rather than in a config file:
+///
+/// ```
+/// ghostty --ui-state-path=~/.local/state/ghostty-custom/ui-state-release.json
+/// ```
+///
+/// **Named sessions.** Nothing ties this to one path, so several saved
+/// arrangements can be kept side by side and chosen per launch:
+///
+/// ```
+/// ghostty --load-ui-state --ui-state-path=~/sessions/review.json
+/// ```
+///
+/// `~` is expanded. A relative path is resolved against the config file that
+/// set it, or against your home directory when it was given on the command
+/// line. Prefer an absolute path and there is nothing to think about.
+@"ui-state-path": ?Path = null,
+
+/// How often to save the UI state while Ghostty is running, in addition to the
+/// saves that already happen when a window closes and when Ghostty exits.
+/// Linux only; has no effect unless `save-ui-state` is enabled.
+///
+/// This exists for the exits Ghostty does not get to take part in: a crash, an
+/// out-of-memory kill, a power cut. Those skip the save on exit entirely, and
+/// without a periodic save the arrangement would be as stale as the last time
+/// you closed a window.
+///
+/// Accepts a duration such as `30s`, `10m`, `1h`. The default is `0`, meaning
+/// no periodic saving. Values below one minute are raised to one minute:
+/// saving is a serialization plus a file write, and there is no arrangement
+/// that changes usefully faster than that.
+///
+/// The timer is not a heartbeat that writes regardless. A save with no windows
+/// open writes nothing, exactly as the other save paths do.
+@"save-ui-state-interval": Duration = .{ .duration = 0 },
+
 /// Resize the window in discrete increments of the focused surface's cell size.
 /// If this is disabled, surfaces are resized in pixel increments. Currently
 /// only supported on macOS.

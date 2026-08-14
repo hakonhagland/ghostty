@@ -21,14 +21,15 @@ const Allocator = std.mem.Allocator;
 
 const global = @import("../../global.zig");
 const internal_os = @import("../../os/main.zig");
+const CoreConfig = @import("../../config.zig").Config;
 
 const log = std.log.scoped(.gtk_session);
 
 /// Where the state file lives, relative to the XDG state directory
 /// (`$XDG_STATE_HOME`, or `~/.local/state` when that is unset).
+/// The default location, used when `ui-state-path` is unset.
 const subdir = "ghostty";
 const filename = "ui-state.json";
-const filename_tmp = "ui-state.json.tmp";
 
 /// An upper bound on the size of a state file we are willing to read. Real
 /// files are a few kilobytes; this only exists so that a corrupt or hostile
@@ -84,6 +85,18 @@ pub const State = struct {
         /// field is specific to this fork; upstream Ghostty has no project
         /// concept.
         project: ?[]const u8 = null,
+
+        /// How recently this tab was used, as the value of the application-wide
+        /// focus counter when it was last focused. Only the *order* of these
+        /// numbers survives a restart — the counter starts from zero on every
+        /// launch — so a reader must sort by them rather than use them
+        /// directly. Null for a tab saved before this field existed.
+        ///
+        /// This is what makes the session search useful immediately after a
+        /// restore: without it the restored tabs are ordered by the order they
+        /// happened to be recreated in, which is not an order the user has ever
+        /// seen.
+        focus_seq: ?u64 = null,
     };
 
     /// True when there is nothing worth writing. We never overwrite a good
@@ -94,7 +107,16 @@ pub const State = struct {
 };
 
 /// The absolute path of the state file. Caller owns the returned memory.
-pub fn path(alloc: Allocator) ![]u8 {
+///
+/// `configured` is the value of the `ui-state-path` option, already expanded by
+/// the config layer, or null to use the default location. Passing it in rather
+/// than reaching for the config here keeps this module free of any dependency
+/// on the running application.
+pub fn path(alloc: Allocator, configured: ?[]const u8) ![]u8 {
+    if (configured) |p| {
+        if (p.len > 0) return try alloc.dupe(u8, p);
+    }
+
     var environ_map = try global.environMap();
     defer environ_map.deinit();
 
@@ -107,6 +129,17 @@ pub fn path(alloc: Allocator) ![]u8 {
     defer alloc.free(dir);
 
     return try std.fs.path.join(alloc, &.{ dir, filename });
+}
+
+/// Pull the configured path out of a config value, or null if unset.
+///
+/// The `?` prefix that marks a `Path` as optional has no meaning for a file we
+/// write ourselves, so both variants are treated the same.
+pub fn configuredPath(config: *const CoreConfig) ?[]const u8 {
+    const p = config.@"ui-state-path" orelse return null;
+    return switch (p) {
+        .optional, .required => |v| v,
+    };
 }
 
 /// Turn a state into the bytes we would write. Caller owns the memory.
@@ -131,21 +164,18 @@ pub fn serialize(alloc: Allocator, state: State) ![]u8 {
 /// Rename is atomic within a directory, so a crash — or a power cut — in the
 /// middle of a write leaves either the old file or the new one, never a
 /// half-written file that would fail to parse on the next launch.
-pub fn save(alloc: Allocator, state: State) !void {
+pub fn save(alloc: Allocator, configured: ?[]const u8, state: State) !void {
     const bytes = try serialize(alloc, state);
     defer alloc.free(bytes);
 
     const io = global.io();
 
-    var environ_map = try global.environMap();
-    defer environ_map.deinit();
-    const dir_path = try internal_os.xdg.state(
-        io,
-        alloc,
-        &environ_map,
-        .{ .subdir = subdir },
-    );
-    defer alloc.free(dir_path);
+    const file_path = try path(alloc, configured);
+    defer alloc.free(file_path);
+
+    const dir_path = std.fs.path.dirname(file_path) orelse return error.BadStatePath;
+    const base = std.fs.path.basename(file_path);
+    if (base.len == 0) return error.BadStatePath;
 
     std.Io.Dir.cwd().createDirPath(io, dir_path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -155,23 +185,24 @@ pub fn save(alloc: Allocator, state: State) !void {
     var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{});
     defer dir.close(io);
 
+    // The temporary file has to live in the same directory as the real one,
+    // because rename is only atomic within a filesystem.
+    const tmp_base = try std.fmt.allocPrint(alloc, "{s}.tmp", .{base});
+    defer alloc.free(tmp_base);
+
     // 0600: the working directories of every terminal you had open are not
     // something other users of the machine need to read.
     try dir.writeFile(io, .{
-        .sub_path = filename_tmp,
+        .sub_path = tmp_base,
         .data = bytes,
         .flags = switch (builtin.os.tag) {
             .windows => .{},
             else => .{ .permissions = .fromMode(0o600) },
         },
     });
-    try dir.rename(filename_tmp, dir, filename, io);
+    try dir.rename(tmp_base, dir, base, io);
 
-    log.info("ui state written path={s}/{s} bytes={d}", .{
-        dir_path,
-        filename,
-        bytes.len,
-    });
+    log.info("ui state written path={s} bytes={d}", .{ file_path, bytes.len });
 }
 
 /// Read the state file back.
@@ -182,10 +213,10 @@ pub fn save(alloc: Allocator, state: State) !void {
 /// never stop Ghostty from starting.
 ///
 /// The result owns its strings and must be freed with `.deinit()`.
-pub fn load(alloc: Allocator) ?std.json.Parsed(State) {
+pub fn load(alloc: Allocator, configured: ?[]const u8) ?std.json.Parsed(State) {
     const io = global.io();
 
-    const file_path = path(alloc) catch |err| {
+    const file_path = path(alloc, configured) catch |err| {
         log.warn("cannot determine ui state path err={}", .{err});
         return null;
     };
@@ -261,6 +292,7 @@ test "serialize and parse a round trip" {
                     .working_directory = "/home/user/src",
                     .title = "build",
                     .project = "ghostty",
+                    .focus_seq = 42,
                 },
                 .{ .working_directory = "/tmp" },
             },
@@ -280,7 +312,33 @@ test "serialize and parse a round trip" {
     try testing.expectEqual(@as(usize, 2), win.tabs.len);
     try testing.expectEqualStrings("build", win.tabs[0].title.?);
     try testing.expectEqualStrings("ghostty", win.tabs[0].project.?);
+    try testing.expectEqual(@as(?u64, 42), win.tabs[0].focus_seq);
     try testing.expectEqual(@as(?[]const u8, null), win.tabs[1].title);
+
+    // A tab saved without a recency value must read back as "unknown" rather
+    // than as zero, so the restore code can tell the two apart.
+    try testing.expectEqual(@as(?u64, null), win.tabs[1].focus_seq);
+}
+
+test "a file from before recency was recorded still parses" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Version 1 files written by the first build have no focus_seq at all.
+    // They must keep working: the field is additive, so it does not justify a
+    // schema version bump, and bumping would throw away the user's session.
+    const bytes =
+        \\{"version":1,"windows":[{"tabs":[
+        \\  {"working_directory":"/a","title":null,"project":null},
+        \\  {"working_directory":"/b","title":null,"project":null}]}]}
+    ;
+
+    var parsed = try parse(alloc, bytes);
+    defer parsed.deinit();
+
+    for (parsed.value.windows[0].tabs) |tab| {
+        try testing.expectEqual(@as(?u64, null), tab.focus_seq);
+    }
 }
 
 test "parse tolerates fields it does not know" {
