@@ -251,6 +251,10 @@ pub const Application = extern struct {
         /// instead of restoring the same session all over again.
         ui_state_restored: bool = false,
 
+        /// The repeating timer behind `save-ui-state-interval`, or null when
+        /// periodic saving is off.
+        ui_state_timer: ?c_uint = null,
+
         // The audio bell's MediaFile, reused across bells so we don't leak a
         // GStreamer pipeline (and its GL threads) on every ring. Built lazily
         // on the first audio bell and rebuilt when `bell-audio-path` changes;
@@ -687,6 +691,10 @@ pub const Application = extern struct {
                 _ = glib.Source.remove(source);
                 priv.ui_state_source = null;
             }
+            if (priv.ui_state_timer) |source| {
+                _ = glib.Source.remove(source);
+                priv.ui_state_timer = null;
+            }
             self.saveUiState();
             priv.ui_state_closing = true;
         }
@@ -920,6 +928,49 @@ pub const Application = extern struct {
         return 0; // remove the source
     }
 
+    /// Start, stop or re-time the periodic save according to the current
+    /// configuration. Safe to call again after a config reload.
+    fn syncUiStateTimer(self: *Self) void {
+        const priv = self.private();
+
+        if (priv.ui_state_timer) |v| {
+            _ = glib.Source.remove(v);
+            priv.ui_state_timer = null;
+        }
+        if (priv.ui_state_closing) return;
+
+        const config = priv.config.get();
+        if (!config.@"save-ui-state") return;
+
+        const ns = config.@"save-ui-state-interval".duration;
+        if (ns == 0) return;
+
+        // A save is a serialization plus a file write. Nothing about an
+        // arrangement of windows changes usefully faster than once a minute,
+        // and a misconfigured `100ms` would otherwise write continuously.
+        const ms = @max(
+            ns / std.time.ns_per_ms,
+            std.time.ms_per_min,
+        );
+
+        priv.ui_state_timer = glib.timeoutAdd(
+            std.math.cast(c_uint, ms) orelse std.math.maxInt(c_uint),
+            uiStateTimerTick,
+            self,
+        );
+        log.debug("periodic ui state save every {d}ms", .{ms});
+    }
+
+    fn uiStateTimerTick(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        if (self.private().ui_state_closing) {
+            self.private().ui_state_timer = null;
+            return 0; // remove the source
+        }
+        self.saveUiState();
+        return 1; // keep the source
+    }
+
     /// Write the UI state now, if the configuration asks for it.
     ///
     /// Errors are logged and swallowed. Failing to save a session is a
@@ -927,7 +978,8 @@ pub const Application = extern struct {
     /// asked Ghostty to do.
     fn saveUiState(self: *Self) void {
         const priv = self.private();
-        if (!priv.config.get().@"save-ui-state") return;
+        const config = priv.config.get();
+        if (!config.@"save-ui-state") return;
 
         const alloc = self.allocator();
 
@@ -948,7 +1000,11 @@ pub const Application = extern struct {
             return;
         }
 
-        session.save(alloc, state) catch |err| {
+        session.save(
+            alloc,
+            session.configuredPath(config),
+            state,
+        ) catch |err| {
             log.warn("unable to save ui state err={}", .{err});
         };
     }
@@ -995,6 +1051,10 @@ pub const Application = extern struct {
                         try alloc.dupe(u8, p)
                     else
                         null,
+                    .focus_seq = if (tab.getActiveSurface()) |s|
+                        s.getFocusSeq()
+                    else
+                        null,
                 });
             }
 
@@ -1026,17 +1086,30 @@ pub const Application = extern struct {
     fn restoreUiState(self: *Self) bool {
         const priv = self.private();
         if (priv.ui_state_restored) return false;
-        if (!priv.config.get().@"load-ui-state") return false;
+
+        const config = priv.config.get();
+        if (!config.@"load-ui-state") return false;
         priv.ui_state_restored = true;
 
         const alloc = self.allocator();
-        var parsed = session.load(alloc) orelse return false;
+        var parsed = session.load(
+            alloc,
+            session.configuredPath(config),
+        ) orelse return false;
         defer parsed.deinit();
+
+        // Windows are created in file order, but the surfaces inside them have
+        // to be re-stamped afterwards in *recency* order, so collect them as we
+        // go. An arena keeps that bookkeeping from leaking into the windows we
+        // are building.
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+        var recency: std.ArrayList(RestoredSurface) = .empty;
 
         var restored: usize = 0;
         for (parsed.value.windows) |saved| {
             if (saved.tabs.len == 0) continue;
-            self.restoreWindow(saved) catch |err| {
+            self.restoreWindow(saved, arena.allocator(), &recency) catch |err| {
                 log.warn("unable to restore a window err={}", .{err});
                 continue;
             };
@@ -1045,11 +1118,48 @@ pub const Application = extern struct {
 
         if (restored == 0) return false;
 
+        self.restoreFocusOrder(recency.items);
+
         log.info("restored ui state windows={d}", .{restored});
         return true;
     }
 
-    fn restoreWindow(self: *Self, saved: session.State.Window) !void {
+    /// A restored surface paired with how recently it had been used when the
+    /// state was saved.
+    const RestoredSurface = struct {
+        surface: *Surface,
+        focus_seq: u64,
+
+        fn lessThan(_: void, a: RestoredSurface, b: RestoredSurface) bool {
+            return a.focus_seq < b.focus_seq;
+        }
+    };
+
+    /// Replay the saved most-recently-used ordering onto the restored surfaces.
+    ///
+    /// The numbers in the file cannot be used as they are: the counter starts
+    /// again at zero on every launch, and each restored surface has already
+    /// been stamped with a fresh value in creation order. Only the *relative*
+    /// order in the file is meaningful, so sort by it and hand out new
+    /// sequence numbers in that order. The result is that the session search
+    /// opens on the order the user left behind rather than the order the file
+    /// happened to list.
+    ///
+    /// Tabs saved before this field existed have no recorded order; they sort
+    /// first, i.e. as the least recently used, which is the safe end to put an
+    /// unknown on.
+    fn restoreFocusOrder(self: *Self, items: []RestoredSurface) void {
+        if (items.len == 0) return;
+        std.mem.sort(RestoredSurface, items, {}, RestoredSurface.lessThan);
+        for (items) |item| item.surface.setFocusSeq(self.nextFocusSeq());
+    }
+
+    fn restoreWindow(
+        self: *Self,
+        saved: session.State.Window,
+        arena: Allocator,
+        recency: *std.ArrayList(RestoredSurface),
+    ) !void {
         const alloc = self.allocator();
         const priv = self.private();
 
@@ -1086,10 +1196,18 @@ pub const Application = extern struct {
             const project = try dupeOptZ(alloc, tab.project);
             defer if (project) |v| alloc.free(v);
 
-            win.restoreTab(.{
+            const created = win.restoreTab(.{
                 .working_directory = wd,
                 .title = title,
                 .project = project,
+            }) orelse continue;
+
+            // Remember where this tab belongs in the recency order. Its
+            // surface exists already, even though it has not been realized.
+            const surface = created.getActiveSurface() orelse continue;
+            try recency.append(arena, .{
+                .surface = surface,
+                .focus_seq = tab.focus_seq orelse 0,
             });
         }
 
@@ -1586,6 +1704,10 @@ pub const Application = extern struct {
                 .{err},
             );
         };
+
+        // A config reload can turn periodic saving on, off, or to a different
+        // interval, so the timer is rebuilt from whatever the config now says.
+        self.syncUiStateTimer();
     }
 
     /// Log CSS parsing error
@@ -1660,6 +1782,9 @@ pub const Application = extern struct {
 
         // Setup our global shortcuts
         self.startupGlobalShortcuts();
+
+        // Start the periodic UI state save, if it is configured.
+        self.syncUiStateTimer();
 
         // If we have any config diagnostics from loading, then we
         // show the diagnostics dialog. We show this one as a general
@@ -1868,6 +1993,10 @@ pub const Application = extern struct {
         if (priv.ui_state_source) |v| {
             _ = glib.Source.remove(v);
             priv.ui_state_source = null;
+        }
+        if (priv.ui_state_timer) |v| {
+            _ = glib.Source.remove(v);
+            priv.ui_state_timer = null;
         }
 
         if (priv.bell_media) |v| {
