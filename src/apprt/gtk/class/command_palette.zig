@@ -98,6 +98,20 @@ pub const CommandPalette = extern struct {
         /// The configuration that this command palette is using.
         config: ?*Config = null,
 
+        /// A mode to show once the dialog has finished closing. See
+        /// `showMode`.
+        reopen: ?Mode = null,
+
+        /// Whether the dialog is on screen.
+        ///
+        /// Tracked here rather than read from `gtk.Widget.getRealized`, which
+        /// is what this used to do and which is wrong: the widget stays
+        /// realized after `closed` has already fired. Activating a command
+        /// closes the palette and then runs the action, so an action that
+        /// reopens the palette saw "still open" and closed it again — the
+        /// Browse Keybindings command appeared to do nothing at all.
+        open: bool = false,
+
         /// What this palette is currently showing.
         mode: Mode = .all,
 
@@ -466,6 +480,36 @@ pub const CommandPalette = extern struct {
     /// Set what this palette shows. Repopulating is deferred until we have a
     /// config, so that this can be called immediately after construction
     /// without tripping the "no config" warning below.
+    pub fn getMode(self: *CommandPalette) Mode {
+        return self.private().mode;
+    }
+
+    /// Whether the dialog is currently on screen.
+    pub fn isOpen(self: *CommandPalette) bool {
+        return self.private().open;
+    }
+
+    /// Show the palette in `mode`, even if it is already open in another one.
+    ///
+    /// Activating a command closes the palette *before* running the action, so
+    /// an action that opens the palette in another mode arrives while the
+    /// dialog is still closing. Presenting then does nothing and toggling
+    /// closes it again — which is why "Browse Keybindings" appeared to do
+    /// nothing at all. Wait for the close to finish, then present.
+    pub fn showMode(self: *CommandPalette, window: *Window, mode: Mode) void {
+        const priv = self.private();
+
+        if (self.isOpen()) {
+            priv.window.set(window);
+            priv.reopen = mode;
+            self.close();
+            return;
+        }
+
+        self.setMode(mode);
+        self.present(window);
+    }
+
     pub fn setMode(self: *CommandPalette, mode: Mode) void {
         const priv = self.private();
         if (priv.mode == mode) return;
@@ -561,6 +605,13 @@ pub const CommandPalette = extern struct {
             const cmd_ref = cmd.as(gobject.Object);
             priv.source.append(cmd_ref);
         }
+
+        // Tell the filter the world changed. The whole source has just been
+        // replaced, and the filter model is incremental, so without this the
+        // new rows can sit unevaluated and the list renders empty — which is
+        // what happened when the palette switched to the keybind mode with a
+        // query still typed.
+        priv.filter.as(gtk.Filter).changed(.different);
     }
 
     /// Collect regular commands from configuration, filtering out unsupported actions.
@@ -734,6 +785,24 @@ pub const CommandPalette = extern struct {
     }
 
     fn dialogClosed(_: *adw.Dialog, self: *CommandPalette) callconv(.c) void {
+        const priv = self.private();
+        priv.open = false;
+
+        // A mode switch was requested while the dialog was open. It has now
+        // finished closing, so it can be shown again.
+        if (priv.reopen) |mode| {
+            priv.reopen = null;
+            if (priv.window.get()) |window| {
+                defer window.unref();
+
+                // Balance the unref below: showing again means another close is
+                // coming, and that close unrefs once more.
+                _ = self.ref();
+                self.setMode(mode);
+                self.present(window);
+            }
+        }
+
         self.unref();
     }
 
@@ -793,6 +862,12 @@ pub const CommandPalette = extern struct {
         }
         if (cmd.propGetActionKey()) |action_key| {
             if (contains(action_key, rest)) return 1;
+        }
+        // Typing the keys should find the command, not only its name. Without
+        // this, "ctrl" in the plain palette matches nothing at all, because no
+        // command is *called* that.
+        if (cmd.triggerText()) |trigger| {
+            if (contains(trigger, rest)) return 1;
         }
 
         return 0;
@@ -929,13 +1004,25 @@ pub const CommandPalette = extern struct {
         const priv = self.private();
 
         // If the dialog has been shown, close it.
-        if (priv.dialog.as(gtk.Widget).getRealized() != 0) {
+        if (priv.open) {
             self.close();
             return;
         }
 
+        self.present(window);
+    }
+
+    /// Show the dialog, unconditionally.
+    ///
+    /// Separate from `toggle` because reopening in a different mode must not
+    /// consult "is it already open" — by then it is mid-close, and asking
+    /// again would close it a second time.
+    fn present(self: *CommandPalette, window: *Window) void {
+        const priv = self.private();
+
         // Remember where a newly created terminal should go.
         priv.window.set(window);
+        priv.open = true;
 
         // Show the dialog
         priv.dialog.present(window.as(gtk.Widget));
@@ -1315,6 +1402,13 @@ const Command = extern struct {
             command: input.Command,
             action: ?[:0]const u8 = null,
             action_key: ?[:0]const u8 = null,
+
+            /// The trigger bound to this command, in the config's own
+            /// spelling — `ctrl+shift+p`. Only used for matching, so that
+            /// typing the keys finds the command in the plain palette the
+            /// same way it finds the binding in the keybind browser.
+            trigger: ?[:0]const u8 = null,
+            trigger_parsed: bool = false,
         };
 
         pub const JumpData = struct {
@@ -1574,6 +1668,35 @@ const Command = extern struct {
         }
 
         j.title = alloc.dupeZ(u8, override orelse effective_title) catch null;
+    }
+
+    /// The keys bound to a regular command, for matching only. Null when the
+    /// command has no binding, which is why this is not simply derived from
+    /// the accelerator each time.
+    fn triggerText(self: *Self) ?[:0]const u8 {
+        const priv = self.private();
+
+        const regular = switch (priv.data) {
+            .regular => |*r| r,
+            .keybind => |*k| return k.trigger,
+            .jump, .create => return null,
+        };
+
+        if (regular.trigger_parsed) return regular.trigger;
+        regular.trigger_parsed = true;
+
+        const cfg = if (priv.config) |config| config.get() else return null;
+        const trigger = cfg.keybind.set.getTrigger(regular.command.action) orelse
+            return null;
+
+        regular.trigger = std.fmt.allocPrintSentinel(
+            priv.arena.allocator(),
+            "{f}",
+            .{trigger},
+            0,
+        ) catch null;
+
+        return regular.trigger;
     }
 
     fn propGetTitle(self: *Self) ?[:0]const u8 {
