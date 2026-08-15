@@ -26,6 +26,11 @@ const Config = @import("config.zig").Config;
 
 const log = std.log.scoped(.gtk_ghostty_command_palette);
 
+/// How far the pointer must travel, in pixels, before it is treated as having
+/// been used rather than merely being in the way. Squared, so the check needs
+/// no square root. See `pointerMoved`.
+const pointer_move_threshold_sq: f64 = 4.0;
+
 /// Replace the home directory prefix with "~" for display, matching what the
 /// macOS palette does for its own entries.
 fn abbreviateHome(alloc: Allocator, path: []const u8) ?[:0]const u8 {
@@ -152,6 +157,14 @@ pub const CommandPalette = extern struct {
         /// newly created terminal goes.
         window: WeakRef(Window) = .empty,
 
+        /// Where the pointer was first seen over the result list, in widget
+        /// coordinates, or `null` if it has not been seen since the list last
+        /// entered keyboard mode.
+        ///
+        /// Only read while in keyboard mode; it is the baseline that
+        /// `pointerMoved` measures real movement against. See `keyboardMode`.
+        pointer_origin: ?[2]f64 = null,
+
         pub var offset: c_int = 0;
     };
 
@@ -200,6 +213,37 @@ pub const CommandPalette = extern struct {
             self,
             .{},
         );
+
+        // Hover must not take the selection until the pointer has actually
+        // been used. Both controllers go on the result list rather than on the
+        // rows, because the rows are built and recycled by the list factory
+        // and there is nowhere to attach anything to them. See `keyboardMode`.
+        const motion = gtk.EventControllerMotion.new();
+        _ = gtk.EventControllerMotion.signals.enter.connect(
+            motion,
+            *Self,
+            pointerEntered,
+            self,
+            .{},
+        );
+        _ = gtk.EventControllerMotion.signals.motion.connect(
+            motion,
+            *Self,
+            pointerMoved,
+            self,
+            .{},
+        );
+        self.private().view.as(gtk.Widget).addController(motion.as(gtk.EventController));
+
+        const click = gtk.GestureClick.new();
+        _ = gtk.GestureClick.signals.pressed.connect(
+            click,
+            *Self,
+            pointerPressed,
+            self,
+            .{},
+        );
+        self.private().view.as(gtk.Widget).addController(click.as(gtk.EventController));
 
         // Shortcuts for the session search. This is on the dialog in the
         // capture phase rather than on the entry so that it still works once
@@ -263,6 +307,11 @@ pub const CommandPalette = extern struct {
                 @min(current + 1, n - 1)
             else if (current == 0) 0 else current - 1;
 
+            // An arrow key is a claim on the selection, so the pointer loses
+            // it again until it is next moved. Without this, scrolling the
+            // list to follow the selection would drag rows across a resting
+            // pointer, and each crossing would select the row it passed.
+            self.keyboardMode();
             priv.model.setSelected(next);
             priv.view.scrollTo(next, .{}, null);
             return 1;
@@ -425,20 +474,121 @@ pub const CommandPalette = extern struct {
         return window;
     }
 
-    /// Move the selection back to the first row.
+    /// Move the selection back to the first row, and take it back from the
+    /// pointer.
     ///
-    /// The list view is `single-click-activate`, which GTK documents as
-    /// "activate rows on single click and select them on hover". Hover
-    /// therefore moves the *selection*, not just the highlight, and Enter
-    /// activates the selection. A pointer left resting anywhere over the list
-    /// silently hijacks what Enter does, including across a change of query
-    /// that reorders the results underneath it.
-    ///
-    /// Re-selecting the first row whenever the query changes keeps the
-    /// keyboard path predictable: after typing, Enter always activates the
-    /// best match.
+    /// Typing is keyboard navigation, so it ends pointer mode: otherwise a
+    /// refiltered list would hand the selection to whichever row happened to
+    /// come to rest under a pointer that never moved.
     fn resetSelection(_: *gtk.SearchEntry, self: *Self) callconv(.c) void {
+        self.keyboardMode();
         self.private().model.setSelected(0);
+    }
+
+    /// Give the selection to the keyboard, and stop the row under the pointer
+    /// from taking it.
+    ///
+    /// The result list is `single-click-activate`, which GTK documents as
+    /// "activate rows on single click **and select them on hover**". Hover
+    /// therefore moves the *selection*, not merely a highlight, and Enter
+    /// activates the selection.
+    ///
+    /// That would be harmless if hover meant "the user moved the pointer onto
+    /// this row", but it does not. Each row connects its hover handler to a
+    /// motion controller's `enter` signal (`gtklistfactorywidget.c`), and
+    /// `enter` is a *crossing* event: GTK emits one whenever pointer and
+    /// widget come to lie on top of one another, including when the widget
+    /// appears underneath a pointer that has not moved at all. So opening the
+    /// palette over the pointer selects whatever row landed there, and Enter
+    /// runs that instead of the best match — the whole point of the switcher
+    /// being that Enter goes to the most recently used terminal.
+    ///
+    /// The same handler returns immediately when `single-click-activate` is
+    /// off, so the property doubles as a switch between "the keyboard owns the
+    /// selection" and "the pointer does". This is the keyboard half.
+    ///
+    /// Turning it off wholesale would work too, but it would also lose
+    /// click-to-activate and hover feedback for people navigating with the
+    /// mouse. Switching modes keeps both, and costs one bool of state that GTK
+    /// is already storing for us.
+    fn keyboardMode(self: *Self) void {
+        const priv = self.private();
+        priv.pointer_origin = null;
+        priv.view.setSingleClickActivate(0);
+    }
+
+    /// Give the selection to the pointer: hover selects again, and a single
+    /// click activates. The other half of `keyboardMode`.
+    fn pointerMode(self: *Self) void {
+        self.private().view.setSingleClickActivate(1);
+    }
+
+    /// Whether the pointer currently owns the selection.
+    fn inPointerMode(self: *Self) bool {
+        return self.private().view.getSingleClickActivate() != 0;
+    }
+
+    /// The pointer arrived over the result list. Record where, but read
+    /// nothing into the arrival itself: this fires when the palette opens
+    /// underneath a pointer that never moved, which is the case the whole
+    /// mechanism exists to ignore. It is only a baseline for `pointerMoved`.
+    fn pointerEntered(
+        _: *gtk.EventControllerMotion,
+        x: f64,
+        y: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        if (self.inPointerMode()) return;
+        priv.pointer_origin = .{ x, y };
+    }
+
+    /// The pointer moved over the result list. Movement of more than a couple
+    /// of pixels is the user choosing to navigate with the mouse, so hover
+    /// selection goes back on.
+    ///
+    /// The distance test is not caution for its own sake. A crossing event is
+    /// routinely followed by a motion event at the very same coordinates, and
+    /// treating that as movement would switch hover back on in the same main
+    /// loop pass that switched it off.
+    fn pointerMoved(
+        _: *gtk.EventControllerMotion,
+        x: f64,
+        y: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        if (self.inPointerMode()) return;
+
+        const origin = priv.pointer_origin orelse {
+            priv.pointer_origin = .{ x, y };
+            return;
+        };
+
+        const dx = x - origin[0];
+        const dy = y - origin[1];
+        if (dx * dx + dy * dy < pointer_move_threshold_sq) return;
+
+        self.pointerMode();
+    }
+
+    /// A click is the pointer being used, even with no movement before it — a
+    /// trackpad tap, or a mouse already resting on the row you want.
+    ///
+    /// Switching mode on *press* rather than on release is what keeps that
+    /// click from feeling dead. A row asks whether single-click activation is
+    /// on when the button is *released*, and press and release are separate
+    /// events, so by the time it asks, this has already run and the answer is
+    /// yes. The row also selects itself on release regardless of the property,
+    /// so the row that activates is the one that was clicked.
+    fn pointerPressed(
+        _: *gtk.GestureClick,
+        _: c_int,
+        _: f64,
+        _: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        self.pointerMode();
     }
 
     fn dispose(self: *Self) callconv(.c) void {
@@ -1030,18 +1180,19 @@ pub const CommandPalette = extern struct {
         // Focus on the search bar when opening the dialog
         _ = priv.search.as(gtk.Widget).grabFocus();
 
-        // If the pointer happens to be resting over the list as it appears,
-        // hover selects that row (see `resetSelection`). That happens as the
-        // list is mapped, which is after this point, so the correction has to
-        // wait for the main loop to settle.
-        _ = glib.idleAddOnce(idleResetSelection, self.ref());
-    }
-
-    /// Userdata is a `*CommandPalette`. Unrefs once.
-    fn idleResetSelection(ud: ?*anyopaque) callconv(.c) void {
-        const self: *Self = @ptrCast(@alignCast(ud orelse return));
-        defer self.unref();
-        self.private().model.setSelected(0);
+        // Keyboard first. The pointer does not get the selection until it is
+        // moved or clicked, so a palette that opens underneath a resting
+        // pointer still has the best match selected. See `keyboardMode`.
+        //
+        // This used to be an idle callback that re-selected row 0, on the
+        // reasoning that the pointer's crossing event arrives after this
+        // point and the correction had to wait for it. That lost the race:
+        // an idle runs at the *earliest* moment the main loop is free, which
+        // is still well before the display server has mapped the window and
+        // worked out what lies under the pointer. Preventing the theft needs
+        // no timing at all.
+        self.keyboardMode();
+        priv.model.setSelected(0);
     }
 
     /// Helper function to send a signal containing the action that should be
