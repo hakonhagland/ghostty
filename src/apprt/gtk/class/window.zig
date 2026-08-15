@@ -2842,6 +2842,15 @@ pub const Window = extern struct {
         };
         defer command_palette.unref();
 
+        // Asking for a mode the palette is not currently in means "show me
+        // that", not "toggle". Toggling would close a palette that is open in
+        // the other mode, which is what made the Browse Keybindings command
+        // appear to do nothing.
+        if (command_palette.isOpen() and command_palette.getMode() != mode) {
+            command_palette.showMode(self, mode);
+            return;
+        }
+
         // A palette that survived from a previous invocation may have been
         // opened in the other mode.
         command_palette.setMode(mode);
