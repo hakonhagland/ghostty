@@ -221,6 +221,15 @@ pub const Action = union(Key) {
     /// surface title or the tab title.
     prompt_title: PromptTitle,
 
+    /// Set the project of the target's tab to a prompted value. It is up to
+    /// the apprt to prompt.
+    ///
+    /// Deliberately its own action rather than another `PromptTitle` value:
+    /// a project is not a title, and `PromptTitle` is mirrored in
+    /// `include/ghostty.h`, so extending it would widen the C API for
+    /// something only the GTK apprt implements.
+    prompt_tab_project,
+
     /// The current working directory has changed for the target terminal.
     pwd: Pwd,
 
@@ -403,6 +412,7 @@ pub const Action = union(Key) {
         set_tab_title,
         set_window_title,
         prompt_title,
+        prompt_tab_project,
         pwd,
         mouse_shape,
         mouse_visibility,

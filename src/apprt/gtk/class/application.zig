@@ -799,6 +799,8 @@ pub const Application = extern struct {
 
             .prompt_title => return Action.promptTitle(target, value),
 
+            .prompt_tab_project => return Action.promptTabProject(target),
+
             .quit => self.quit(),
 
             .quit_timer => try Action.quitTimer(self, value),
@@ -3379,6 +3381,24 @@ const Action = struct {
                         return true;
                     },
                 }
+            },
+        }
+    }
+
+    pub fn promptTabProject(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |v| {
+                const surface = v.rt_surface.surface;
+                const tab = ext.getAncestor(
+                    Tab,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a tab, ignoring prompt_tab_project", .{});
+                    return false;
+                };
+                tab.promptTabProject();
+                return true;
             },
         }
     }

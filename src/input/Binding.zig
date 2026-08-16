@@ -614,6 +614,12 @@ pub const Action = union(enum) {
     ///
     /// Only implemented on Linux.
     prompt_window_title,
+    /// Set the project the current tab belongs to, via a pop-up prompt.
+    /// Leaving the prompt blank removes the tab from its project.
+    ///
+    /// The project is shown in the tab title and as a colored dot in the
+    /// tab bar, and it is what the session search's `@name` filter matches.
+    prompt_tab_project,
 
     /// Set the title for the current focused surface.
     ///
@@ -1424,6 +1430,7 @@ pub const Action = union(enum) {
             .prompt_surface_title,
             .prompt_tab_title,
             .prompt_window_title,
+            .prompt_tab_project,
             .set_surface_title,
             .set_tab_title,
             .set_window_title,

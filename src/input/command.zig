@@ -471,6 +471,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Prompt for a new title for the current window.",
         }},
 
+        .prompt_tab_project => comptime &.{.{
+            .action = .prompt_tab_project,
+            .title = i18n.N_("Set Project Name…"),
+            .description = i18n.N_("Prompt for the project the current tab belongs to. Leave blank to remove it from its project."),
+        }},
+
         .new_split => comptime &.{
             .{
                 .action = .{ .new_split = .left },

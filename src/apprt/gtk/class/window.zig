@@ -449,6 +449,7 @@ pub const Window = extern struct {
             .init("prompt-window-name", actionPromptWindowName, null),
             .init("prompt-context-tab-title", actionPromptContextTabTitle, null),
             .init("prompt-window-title", actionPromptWindowTitle, null),
+            .init("prompt-context-tab-project", actionPromptContextTabProject, null),
             .init("ring-bell", actionRingBell, null),
             .init("split-right", actionSplitRight, null),
             .init("split-left", actionSplitLeft, null),
@@ -2740,11 +2741,25 @@ pub const Window = extern struct {
         _: ?*glib.Variant,
         self: *Self,
     ) callconv(.c) void {
-        const priv = self.private();
-        const page = priv.context_menu_page orelse return;
-        const child = page.getChild();
-        const tab = gobject.ext.cast(Tab, child) orelse return;
+        const tab = self.contextMenuTab() orelse return;
         tab.promptTabTitle();
+    }
+
+    /// Both act on the tab that was right-clicked, which is not necessarily
+    /// the selected one — that is the whole point of a context menu.
+    fn actionPromptContextTabProject(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const tab = self.contextMenuTab() orelse return;
+        tab.promptTabProject();
+    }
+
+    /// The tab the tab-bar context menu was opened on.
+    fn contextMenuTab(self: *Self) ?*Tab {
+        const page = self.private().context_menu_page orelse return null;
+        return gobject.ext.cast(Tab, page.getChild());
     }
 
     fn actionPromptSurfaceTitle(
