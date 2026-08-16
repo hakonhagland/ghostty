@@ -688,7 +688,7 @@ pub const CommandPalette = extern struct {
         // wondering what the box accepts. The footer is already full.
         priv.search.setPlaceholderText(switch (priv.mode) {
             .all => i18n._("Execute a command…"),
-            .jump => i18n._("Switch to a terminal, or @project, or %window…"),
+            .jump => i18n._("Switch to a terminal, or @project, or %window, or \"@ \" for no project…"),
             .keybinds => i18n._("Search keybindings by action or by key…"),
         });
 
@@ -986,17 +986,30 @@ pub const CommandPalette = extern struct {
         if (query.project) |q| {
             // A project query is only meaningful for terminals.
             if (!cmd.isJump()) return 0;
-            const project = cmd.propGetProject() orelse return 0;
-            if (!contains(project, q)) return 0;
+            switch (q) {
+                .named => |n| {
+                    const project = cmd.propGetProject() orelse return 0;
+                    if (!contains(project, n)) return 0;
+                },
+                // `@ ` asks for the terminals that belong to no project.
+                // They are exactly the ones a named query can never reach,
+                // because a name has nothing to match against here.
+                .unset => if (cmd.propGetProject() != null) return 0,
+            }
         }
 
         if (query.window) |q| {
             // Likewise a window query. A terminal in an unnamed window cannot
-            // match one, which is the point: naming a window is how you carve
-            // a subset out of the list.
+            // match a named one, which is the point: naming a window is how
+            // you carve a subset out of the list. `% ` asks for the rest.
             if (!cmd.isJump()) return 0;
-            const window = cmd.getWindowName() orelse return 0;
-            if (!contains(window, q)) return 0;
+            switch (q) {
+                .named => |n| {
+                    const window = cmd.getWindowName() orelse return 0;
+                    if (!contains(window, n)) return 0;
+                },
+                .unset => if (cmd.getWindowName() != null) return 0,
+            }
         }
 
         if (rest.len == 0) return 1;
@@ -1059,8 +1072,15 @@ pub const CommandPalette = extern struct {
 
         // A bare `@` is a sigil with nothing after it, so there is nothing to
         // create yet. Without this the row reads `Create terminal ""`.
+        //
+        // `@ ` has to be excluded for the same reason and is not caught by the
+        // same test: it *is* a filter, so the field is not null, but "no
+        // project" is not something you can create a terminal out of either.
+        // Only a name — a sigil's, or the query's own text — is.
         const parsed = Window.parseQuery(query);
-        if (parsed.project == null and parsed.window == null and parsed.rest.len == 0) return;
+        const names_project = if (parsed.project) |f| f.name() != null else false;
+        const names_window = if (parsed.window) |f| f.name() != null else false;
+        if (!names_project and !names_window and parsed.rest.len == 0) return;
 
         const cwd = if (priv.window.get()) |window| cwd: {
             defer window.unref();
@@ -1103,7 +1123,12 @@ pub const CommandPalette = extern struct {
             if (self.selectedTab()) |tab| {
                 if (tab.getProject()) |p| break :project p;
             }
-            if (typed_project) |p| break :project p;
+            if (typed_project) |f| switch (f) {
+                .named => |n| break :project n,
+                // `@ ` asked for no project. Offering the current one in the
+                // dialog would quietly undo that.
+                .unset => break :project "",
+            };
             break :project window.currentProject() orelse "";
         };
 
@@ -1868,20 +1893,34 @@ const Command = extern struct {
                 const name = parsed.rest;
                 const alloc = priv.arena.allocator();
                 c.title = title: {
-                    if (project) |p| {
-                        if (name.len == 0) break :title std.fmt.allocPrintSentinel(
+                    if (project) |f| switch (f) {
+                        .named => |p| {
+                            if (name.len == 0) break :title std.fmt.allocPrintSentinel(
+                                alloc,
+                                "Create terminal in \"{s}\"",
+                                .{p},
+                                0,
+                            ) catch null;
+                            break :title std.fmt.allocPrintSentinel(
+                                alloc,
+                                "Create terminal \"{s}\" in \"{s}\"",
+                                .{ name, p },
+                                0,
+                            ) catch null;
+                        },
+
+                        // `@ ` creates deliberately outside any project, and
+                        // the row has to say so: the plain `Create terminal
+                        // "x"` label belongs to a query that would *inherit*
+                        // the current project. Same words, different outcome,
+                        // so they cannot share a label.
+                        .unset => break :title std.fmt.allocPrintSentinel(
                             alloc,
-                            "Create terminal in \"{s}\"",
-                            .{p},
+                            "Create terminal \"{s}\" with no project",
+                            .{name},
                             0,
-                        ) catch null;
-                        break :title std.fmt.allocPrintSentinel(
-                            alloc,
-                            "Create terminal \"{s}\" in \"{s}\"",
-                            .{ name, p },
-                            0,
-                        ) catch null;
-                    }
+                        ) catch null,
+                    };
                     break :title std.fmt.allocPrintSentinel(
                         alloc,
                         "Create terminal \"{s}\"",
