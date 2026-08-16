@@ -505,14 +505,42 @@ pub const Window = extern struct {
     /// directory a new terminal will start in before you commit to creating it.
     /// What the user typed into the switcher, taken apart.
     pub const Query = struct {
-        /// The project named by `@name`, if any.
-        project: ?[]const u8 = null,
+        /// What `@…` says about projects, or null if it said nothing.
+        project: ?Filter = null,
 
-        /// The window named by `%name`, if any.
-        window: ?[]const u8 = null,
+        /// What `%…` says about windows, or null if it said nothing.
+        window: ?Filter = null,
 
         /// Everything that is not a sigil token: ordinary search text.
         rest: []const u8 = "",
+
+        /// What one sigil selects.
+        ///
+        /// A sigil can say two different things and a plain string can only
+        /// carry one of them: `@web` names something to match, while `@ `
+        /// names the *absence* of a name. Spelling the second as an empty
+        /// string would be a trap — `contains(project, "")` is true of every
+        /// project, so the filter would match precisely the terminals it is
+        /// meant to exclude, and nothing would report the mistake. A union
+        /// makes every reader choose.
+        pub const Filter = union(enum) {
+            /// `@name` — match names containing this. Never empty.
+            named: []const u8,
+
+            /// `@ ` — match only those that have no name at all.
+            unset,
+
+            /// The text to match against, or null when this filter asks for
+            /// the absence of a name. For the several callers where "nothing
+            /// to match against" and "no filter at all" amount to the same
+            /// thing.
+            pub fn name(self: Filter) ?[]const u8 {
+                return switch (self) {
+                    .named => |v| v,
+                    .unset => null,
+                };
+            }
+        };
     };
 
     /// Split text the user typed into the switcher into its sigil tokens and
@@ -536,8 +564,12 @@ pub const Window = extern struct {
     /// first character of a token is significant, so a colon anywhere in a path
     /// or a running command cannot be mistaken for a separator.
     pub fn parseQuery(typed: []const u8) Query {
-        var result: Query = .{ .rest = typed };
-        var remaining = std.mem.trim(u8, typed, " ");
+        var result: Query = .{};
+
+        // Only the front is trimmed here. The trailing space is *significant*
+        // — it is the whole difference between `@` and `@ ` — so `rest` is
+        // trimmed at the end instead, once the sigils have been read.
+        var remaining = std.mem.trimStart(u8, typed, " ");
 
         while (remaining.len > 0) {
             const sigil = remaining[0];
@@ -547,22 +579,43 @@ pub const Window = extern struct {
             const end = std.mem.indexOfScalar(u8, after, ' ') orelse after.len;
             const token = after[0..end];
 
-            // A bare sigil names nothing *yet*. Treating it as a filter would
-            // make every row vanish the instant the sigil is typed, which is
-            // the worst possible moment: it reads as "there is nothing here"
-            // exactly when the user has committed to narrowing and has not yet
-            // said to what. An empty query shows everything, so a bare sigil
-            // should too.
-            if (token.len > 0) switch (sigil) {
-                '@' => result.project = token,
-                '%' => result.window = token,
+            // Three cases, and the difference between the last two is a single
+            // space:
+            //
+            //   `@web`  a name to match.
+            //   `@ `    an empty token that was deliberately ended. This
+            //           selects the terminals with no project, which no name
+            //           can ever select.
+            //   `@`     an empty token at the end of the input, which names
+            //           nothing *yet*. Filtering on it would make every row
+            //           vanish the instant the sigil is typed — the worst
+            //           possible moment, reading as "there is nothing here"
+            //           exactly when the user has committed to narrowing and
+            //           has not yet said to what. An empty query shows
+            //           everything, so a bare sigil should too. Typing `@web`
+            //           passes through this state and never through `@ `.
+            const filter: ?Query.Filter = if (token.len > 0)
+                .{ .named = token }
+            else if (after.len > 0)
+                .unset
+            else
+                null;
+
+            if (filter) |f| switch (sigil) {
+                '@' => result.project = f,
+                '%' => result.window = f,
                 else => unreachable,
             };
 
             remaining = std.mem.trimStart(u8, after[end..], " ");
-            result.rest = remaining;
         }
 
+        // `rest` comes from `remaining` and not from the raw argument. It used
+        // to be seeded with `typed` and only overwritten inside the loop, so a
+        // query that began with anything other than a sigil kept its leading
+        // spaces: `"  log"` was matched as the literal string `"  log"` and
+        // found nothing.
+        result.rest = std.mem.trimEnd(u8, remaining, " ");
         return result;
     }
 
@@ -711,7 +764,15 @@ pub const Window = extern struct {
         // An explicitly typed project wins; otherwise the new terminal joins
         // the project of the one we are in, which is what makes creating a
         // second terminal in the same project need no typing at all.
-        const project = parseQuery(typed).project orelse self.currentProject();
+        const project: ?[]const u8 = project: {
+            const typed_filter = parseQuery(typed).project orelse
+                break :project self.currentProject();
+
+            // `@ ` asks for no project *on purpose*, so there is no project
+            // directory to look up and the current project must not be
+            // inherited either — refusing to inherit is the point of typing it.
+            break :project typed_filter.name();
+        };
         if (project) |p| {
             if (projectCwd(p)) |cwd| return cwd;
         }
@@ -772,17 +833,27 @@ pub const Window = extern struct {
         const parent = if (self.getActiveSurface()) |v| v.core() else null;
 
         const query = parseQuery(typed);
-        const typed_project = query.project;
         const name = query.rest;
-        const inherited = if (typed_project == null) self.currentProject() else null;
+
+        // Three outcomes, one per shape of the `@` token:
+        //
+        //   `@web name`  the named project.
+        //   `@ name`     no project, and do not inherit one. This is the only
+        //                way to make an unprojected terminal from inside a
+        //                project, since a bare name inherits.
+        //   `name`       inherit from the terminal we are in, which is what
+        //                makes a second terminal in a project need no typing.
+        const typed_name: ?[]const u8 = if (query.project) |f| f.name() else null;
+        const inherited = if (query.project == null) self.currentProject() else null;
 
         const alloc = Application.default().allocator();
         const project: ?[:0]const u8 = project: {
             if (inherited) |p| break :project p;
-            const p = typed_project orelse break :project null;
+            const p = typed_name orelse break :project null;
             break :project alloc.dupeZ(u8, p) catch null;
         };
-        defer if (typed_project != null) {
+        // Only the typed name was duplicated; the inherited one is borrowed.
+        defer if (typed_name != null) {
             if (project) |p| alloc.free(p);
         };
 
@@ -3000,34 +3071,56 @@ test "parseQuery" {
     const P = Window.parseQuery;
 
     // No sigil: everything is "rest", untouched.
-    try testing.expectEqual(@as(?[]const u8, null), P("download").project);
+    try testing.expectEqual(@as(?Window.Query.Filter, null), P("download").project);
     try testing.expectEqualStrings("download", P("download").rest);
 
     // A colon is just a character now, which is the point of the change.
-    try testing.expectEqual(@as(?[]const u8, null), P("http://x:8080").project);
+    try testing.expectEqual(@as(?Window.Query.Filter, null), P("http://x:8080").project);
     try testing.expectEqualStrings("http://x:8080", P("http://x:8080").rest);
 
     // Sigil alone, and partial names, so narrowing works while typing.
-    try testing.expectEqualStrings("f", P("@f").project.?);
-    try testing.expectEqualStrings("fo", P("@fo").project.?);
-    try testing.expectEqualStrings("foo", P("@foo").project.?);
+    try testing.expectEqualStrings("f", P("@f").project.?.named);
+    try testing.expectEqualStrings("fo", P("@fo").project.?.named);
+    try testing.expectEqualStrings("foo", P("@foo").project.?.named);
     try testing.expectEqualStrings("", P("@foo").rest);
 
     // Project and rest.
-    try testing.expectEqualStrings("foo", P("@foo download").project.?);
+    try testing.expectEqualStrings("foo", P("@foo download").project.?.named);
     try testing.expectEqualStrings("download", P("@foo download").rest);
 
     // Extra spaces collapse; the rest keeps its own internal spaces.
-    try testing.expectEqualStrings("foo", P("  @foo   a b  ").project.?);
+    try testing.expectEqualStrings("foo", P("  @foo   a b  ").project.?.named);
     try testing.expectEqualStrings("a b", P("  @foo   a b  ").rest);
 
     // A bare sigil names no project yet, and must behave like an empty query
     // rather than filtering everything away the moment it is typed.
-    try testing.expectEqual(@as(?[]const u8, null), P("@").project);
+    try testing.expectEqual(@as(?Window.Query.Filter, null), P("@").project);
     try testing.expectEqualStrings("", P("@").rest);
-    try testing.expectEqual(@as(?[]const u8, null), P("  @  ").project);
-    try testing.expectEqualStrings("", P("  @  ").rest);
     try testing.expectEqualStrings("", P("").rest);
+
+    // `@ ` — an empty token that was deliberately ended by a space — selects
+    // the terminals that have no project. This is the one case a name cannot
+    // express, and the only thing separating it from the bare sigil above is
+    // that space.
+    try testing.expectEqual(Window.Query.Filter.unset, P("@ ").project.?);
+    try testing.expectEqualStrings("", P("@ ").rest);
+    try testing.expectEqual(Window.Query.Filter.unset, P("  @  ").project.?);
+    try testing.expectEqualStrings("", P("  @  ").rest);
+
+    // …and it still leaves room for search text after it.
+    try testing.expectEqual(Window.Query.Filter.unset, P("@ log").project.?);
+    try testing.expectEqualStrings("log", P("@ log").rest);
+
+    // Typing `@web` passes through `@` but never through `@ `, so narrowing
+    // towards a project never flickers through the unprojected list.
+    try testing.expectEqualStrings("w", P("@w").project.?.named);
+
+    // A query that starts with something other than a sigil used to keep its
+    // leading spaces, because `rest` was seeded from the raw argument and only
+    // rewritten inside the sigil loop. `"  log"` then matched nothing.
+    try testing.expectEqualStrings("log", P("  log").rest);
+    try testing.expectEqualStrings("log", P("  log  ").rest);
+    try testing.expectEqual(@as(?Window.Query.Filter, null), P("  log").project);
 }
 
 test "parseQuery window sigil" {
@@ -3035,31 +3128,43 @@ test "parseQuery window sigil" {
     const P = Window.parseQuery;
 
     // `%` names a window, exactly as `@` names a project.
-    try testing.expectEqualStrings("left", P("%left").window.?);
+    try testing.expectEqualStrings("left", P("%left").window.?.named);
     try testing.expectEqualStrings("", P("%left").rest);
-    try testing.expectEqualStrings("left", P("%left log").window.?);
+    try testing.expectEqualStrings("left", P("%left log").window.?.named);
     try testing.expectEqualStrings("log", P("%left log").rest);
-    try testing.expectEqual(@as(?[]const u8, null), P("%left").project);
+    try testing.expectEqual(@as(?Window.Query.Filter, null), P("%left").project);
 
     // A bare `%` narrows nothing yet, same as a bare `@`.
-    try testing.expectEqual(@as(?[]const u8, null), P("%").window);
+    try testing.expectEqual(@as(?Window.Query.Filter, null), P("%").window);
     try testing.expectEqualStrings("", P("%").rest);
+
+    // And `% ` selects the terminals in unnamed windows, exactly as `@ `
+    // selects the ones with no project. The two sigils answer the same input
+    // the same way on purpose.
+    try testing.expectEqual(Window.Query.Filter.unset, P("% ").window.?);
+    try testing.expectEqual(@as(?Window.Query.Filter, null), P("% ").project);
+    try testing.expectEqualStrings("log", P("% log").rest);
 
     // Both sigils, in either order, mean the same thing.
     for ([_][]const u8{ "%left @web log", "@web %left log" }) |q| {
-        try testing.expectEqualStrings("left", P(q).window.?);
-        try testing.expectEqualStrings("web", P(q).project.?);
+        try testing.expectEqualStrings("left", P(q).window.?.named);
+        try testing.expectEqualStrings("web", P(q).project.?.named);
         try testing.expectEqualStrings("log", P(q).rest);
     }
 
+    // The two kinds mix: no project, in a window called "left".
+    try testing.expectEqual(Window.Query.Filter.unset, P("@ %left log").project.?);
+    try testing.expectEqualStrings("left", P("@ %left log").window.?.named);
+    try testing.expectEqualStrings("log", P("@ %left log").rest);
+
     // A sigil that is not leading is ordinary text: a stray `%` in a command
     // line or a path must not be read as a filter.
-    try testing.expectEqual(@as(?[]const u8, null), P("make %.o").window);
+    try testing.expectEqual(@as(?Window.Query.Filter, null), P("make %.o").window);
     try testing.expectEqualStrings("make %.o", P("make %.o").rest);
 
     // The window is not remembered from a previous parse, and an unnamed
     // window query leaves the project alone.
-    try testing.expectEqual(@as(?[]const u8, null), P("@web log").window);
+    try testing.expectEqual(@as(?Window.Query.Filter, null), P("@web log").window);
 }
 
 test "composeTitle" {
