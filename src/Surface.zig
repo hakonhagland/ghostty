@@ -5189,6 +5189,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .window,
         ),
 
+        .prompt_tab_project => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .prompt_tab_project,
+            {},
+        ),
+
         .set_surface_title => |v| {
             const title = try self.alloc.dupeZ(u8, v);
             defer self.alloc.free(title);
