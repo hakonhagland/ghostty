@@ -861,6 +861,45 @@ pub const CommandPalette = extern struct {
             errdefer cmd.unref();
             try commands.append(alloc, cmd);
         }
+
+        // ...and then the tabs that have a widget but no terminal behind it
+        // yet, which the list above cannot contain.
+        //
+        // A tab does not create its terminal until it is first shown: that
+        // happens in `Surface.initSurface`, whose only caller is the GL area's
+        // resize handler, and an unselected tab lives in the stack inside
+        // `AdwTabView`, which allocates only the page it is showing. The list
+        // above is exactly the list `initSurface` appends to. So a session
+        // restored with twenty tabs used to offer one row — whichever tab
+        // happened to be selected — and the switcher was useless until every
+        // tab had been clicked by hand.
+        //
+        // Nothing more is needed to list them. A row is built from the
+        // *widget*, not the terminal, and the restore path has already put the
+        // saved working directory, title, project and recency stamp on it.
+        // Activating a row selects its tab through the widget tree, which is
+        // what wakes it.
+        const list: ?*glib.List = app.as(gtk.Application).getWindows();
+        var it: ?*glib.List = list;
+        while (it) |node| : (it = node.f_next) {
+            const ptr = node.f_data orelse continue;
+            const gtk_window: *gtk.Window = @ptrCast(@alignCast(ptr));
+            const window = gobject.ext.cast(Window, gtk_window) orelse continue;
+
+            for (0..window.getTabCount()) |i| {
+                const tab = window.getTabAt(i) orelse continue;
+
+                // A tab with no terminal cannot have been split — splitting is
+                // something you do to a terminal — so its single surface is
+                // the active one, and asking for that is enough.
+                const surface = tab.getActiveSurface() orelse continue;
+                if (surface.core() != null) continue;
+
+                const cmd = Command.newJump(config, surface, plain);
+                errdefer cmd.unref();
+                try commands.append(alloc, cmd);
+            }
+        }
     }
 
     /// Compare two commands for sorting.

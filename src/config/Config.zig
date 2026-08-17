@@ -2390,6 +2390,32 @@ keybind: Keybinds = .{},
 /// open writes nothing, exactly as the other save paths do.
 @"save-ui-state-interval": Duration = .{ .duration = 0 },
 
+/// After restoring a session, start every restored tab instead of leaving it
+/// dormant until it is first clicked. Linux only; has no effect unless
+/// `load-ui-state` is used.
+///
+/// A restored tab is normally a widget with nothing behind it: Ghostty creates
+/// a tab's terminal, and so starts its shell, the first time the tab is shown.
+/// That is why a freshly restored tab is blank for a moment when you click it
+/// — the shell is starting right then — and why the session search lists only
+/// the tabs you have already visited.
+///
+/// With this enabled, each restored tab is shown briefly in turn, one every
+/// few tens of milliseconds, and the tab you left selected is selected again
+/// at the end. The tabs are then all live, exactly as if you had clicked
+/// through them yourself.
+///
+/// The cost is honest and worth knowing before enabling it. **The tabs visibly
+/// flick past while it runs**, because showing a tab is the only way to start
+/// it — Ghostty has no way to allocate a tab that is not on screen. And every
+/// restored tab starts a shell, so twenty restored tabs means twenty shell
+/// startups spread over the first second or two rather than none at all.
+///
+/// Off by default. The session search lists dormant tabs regardless of this
+/// setting, so leaving it off costs you the startup delay on first click and
+/// nothing else.
+@"ui-state-wake-tabs": bool = false,
+
 /// Resize the window in discrete increments of the focused surface's cell size.
 /// If this is disabled, surfaces are resized in pixel increments. Currently
 /// only supported on macOS.
