@@ -255,6 +255,10 @@ pub const Application = extern struct {
         /// periodic saving is off.
         ui_state_timer: ?c_uint = null,
 
+        /// The pass that starts every restored tab, behind
+        /// `ui-state-wake-tabs`, or null when it is off or already finished.
+        wake: ?*Wake = null,
+
         // The audio bell's MediaFile, reused across bells so we don't leak a
         // GStreamer pipeline (and its GL threads) on every ring. Built lazily
         // on the first audio bell and rebuilt when `bell-audio-path` changes;
@@ -1126,6 +1130,12 @@ pub const Application = extern struct {
 
         self.restoreFocusOrder(recency.items);
 
+        // Optional, and off by default: start every restored tab rather than
+        // leaving it dormant until it is first clicked. Must come after the
+        // recency order is settled — the pass records the stamps it has to put
+        // back afterwards.
+        self.startWakingRestoredTabs(recency.items);
+
         log.info("restored ui state windows={d}", .{restored});
         return true;
     }
@@ -1158,6 +1168,191 @@ pub const Application = extern struct {
         if (items.len == 0) return;
         std.mem.sort(RestoredSurface, items, {}, RestoredSurface.lessThan);
         for (items) |item| item.surface.setFocusSeq(self.nextFocusSeq());
+    }
+
+    /// How long to wait between waking one restored tab and the next.
+    ///
+    /// Not a politeness delay. Showing a tab only starts its terminal once GTK
+    /// has laid the page out and given the GL area a size, which happens on a
+    /// frame — so the pass has to leave a frame between each tab or it would
+    /// select twenty pages and start one terminal. At 50ms there are about
+    /// three frames to spare, and twenty tabs take a second.
+    const wake_interval_ms: c_uint = 50;
+
+    /// The state of the pass that starts every restored tab. See
+    /// `startWakingRestoredTabs`.
+    const Wake = struct {
+        /// The windows to walk, in order, each holding a **strong** reference.
+        ///
+        /// Strong rather than weak on purpose. The pass lives for a second or
+        /// two, and a weak reference would have to be cleared on a path that
+        /// has already cost this project one use-after-free. A window closed
+        /// while the pass is running simply stays alive a moment longer, and
+        /// its tab count goes to zero, which the walk already handles.
+        windows: []*Window,
+
+        /// The tab each window must end on, by index — where the user left it.
+        selected: []usize,
+
+        /// The recency stamp each restored surface must end with.
+        ///
+        /// Showing a tab focuses it, and focusing stamps a fresh sequence
+        /// number. Without putting these back, the pass would quietly rewrite
+        /// the most-recently-used order that `restoreFocusOrder` had just
+        /// reconstructed from the state file into plain left-to-right tab
+        /// order — which is the one thing the session search is for.
+        seqs: []Seq,
+
+        /// Position of the walk: which window, and which tab within it.
+        win: usize = 0,
+        tab: usize = 0,
+
+        const Seq = struct { surface: *Surface, value: u64 };
+
+        fn deinit(self: *Wake, alloc: Allocator) void {
+            for (self.windows) |w| w.unref();
+            for (self.seqs) |s| s.surface.unref();
+            alloc.free(self.windows);
+            alloc.free(self.selected);
+            alloc.free(self.seqs);
+            alloc.destroy(self);
+        }
+    };
+
+    /// Begin starting every restored tab, one per tick. Does nothing unless
+    /// `ui-state-wake-tabs` is set.
+    ///
+    /// Why a pass at all, rather than simply creating the terminals: a tab's
+    /// terminal is created by the GL area's resize handler, and an unselected
+    /// tab is never given a size, because the stack inside `AdwTabView`
+    /// allocates only the page it is showing. Selecting each tab in turn is
+    /// what a user does by hand today, and it is the only lever available from
+    /// outside the surface lifecycle.
+    fn startWakingRestoredTabs(self: *Self, restored: []const RestoredSurface) void {
+        const priv = self.private();
+        if (!priv.config.get().@"ui-state-wake-tabs") return;
+        if (priv.wake != null) return;
+
+        const alloc = self.allocator();
+
+        var windows: std.ArrayList(*Window) = .empty;
+        defer windows.deinit(alloc);
+        var selected: std.ArrayList(usize) = .empty;
+        defer selected.deinit(alloc);
+
+        const list: ?*glib.List = self.as(gtk.Application).getWindows();
+        var it: ?*glib.List = list;
+        while (it) |node| : (it = node.f_next) {
+            const ptr = node.f_data orelse continue;
+            const gtk_window: *gtk.Window = @ptrCast(@alignCast(ptr));
+            const window = gobject.ext.cast(Window, gtk_window) orelse continue;
+            if (window.isQuickTerminal()) continue;
+
+            windows.append(alloc, window.ref()) catch {
+                window.unref();
+                return;
+            };
+            selected.append(alloc, window.getSelectedTabIndex() orelse 0) catch return;
+        }
+
+        if (windows.items.len == 0) return;
+
+        var seqs: std.ArrayList(Wake.Seq) = .empty;
+        defer seqs.deinit(alloc);
+        for (restored) |item| {
+            seqs.append(alloc, .{
+                .surface = item.surface.ref(),
+                .value = item.surface.getFocusSeq(),
+            }) catch {
+                item.surface.unref();
+                return;
+            };
+        }
+
+        const wake = alloc.create(Wake) catch return;
+        wake.* = .{
+            .windows = windows.toOwnedSlice(alloc) catch {
+                alloc.destroy(wake);
+                return;
+            },
+            .selected = selected.toOwnedSlice(alloc) catch {
+                alloc.destroy(wake);
+                return;
+            },
+            .seqs = seqs.toOwnedSlice(alloc) catch {
+                alloc.destroy(wake);
+                return;
+            },
+        };
+        priv.wake = wake;
+
+        // The source id is deliberately not kept, unlike `ui_state_timer`.
+        // This timer removes itself as soon as the walk is done, a second or
+        // two into the launch, so there is never a later moment at which
+        // something would want to cancel it.
+        _ = glib.timeoutAdd(wake_interval_ms, wakeTick, self);
+    }
+
+    /// Show the next dormant restored tab. Userdata is a `*Application`.
+    fn wakeTick(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        const priv = self.private();
+        const wake = priv.wake orelse return 0;
+
+        while (wake.win < wake.windows.len) {
+            const window = wake.windows[wake.win];
+            if (wake.tab >= window.getTabCount()) {
+                wake.win += 1;
+                wake.tab = 0;
+                continue;
+            }
+
+            const index = wake.tab;
+            wake.tab += 1;
+
+            const tab = window.getTabAt(index) orelse continue;
+            const surface = tab.getActiveSurface() orelse continue;
+
+            // Already has a terminal — the selected tab, or one the user
+            // clicked while the pass was running.
+            if (surface.core() != null) continue;
+
+            window.selectTabIndex(index);
+            return 1;
+        }
+
+        self.finishWakingRestoredTabs();
+        return 0;
+    }
+
+    /// Put back what the pass disturbed: the selected tab in each window, and
+    /// the recency order of every restored surface.
+    fn finishWakingRestoredTabs(self: *Self) void {
+        const priv = self.private();
+        const wake = priv.wake orelse return;
+        priv.wake = null;
+
+        for (wake.windows, wake.selected) |window, index| {
+            window.selectTabIndex(index);
+        }
+
+        // After the selection, so that the tab actually being looked at keeps
+        // the fresh stamp that focusing it just gave it. It is the most
+        // recently used one, and it is the only surface whose restored stamp
+        // is deliberately not put back.
+        const selected_surface: ?*Surface = surface: {
+            if (wake.windows.len == 0) break :surface null;
+            const window = wake.windows[0];
+            const tab = window.getTabAt(wake.selected[0]) orelse break :surface null;
+            break :surface tab.getActiveSurface();
+        };
+
+        for (wake.seqs) |s| {
+            if (selected_surface) |sel| if (sel == s.surface) continue;
+            s.surface.setFocusSeq(s.value);
+        }
+
+        wake.deinit(self.allocator());
     }
 
     fn restoreWindow(
