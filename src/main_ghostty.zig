@@ -225,10 +225,13 @@ pub const std_options: std.Options = .{
     // More details:
     //   https://codeberg.org/ziglang/zig/commit/89f86e46d278a35a613bbc662cdd3f65ffc76ed7
     //
+    // Note the negation: `strip_debug_info` is true when the information a
+    // stack trace is built from has been *removed*, so tracing is possible
+    // exactly when it is false.
     .allow_stack_tracing = if (builtin.target.os.tag.isDarwin() and builtin.target.os.tag != .macos)
         false
     else
-        builtin.strip_debug_info,
+        !builtin.strip_debug_info,
 };
 
 test {
