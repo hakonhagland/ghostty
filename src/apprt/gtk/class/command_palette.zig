@@ -776,14 +776,36 @@ pub const CommandPalette = extern struct {
         };
 
         const dialog = NewTerminalDialog.new(name, project);
+
+        // The reference here is not optional, and it is not defensive. The
+        // palette holds the *only* reference to itself and releases it as soon
+        // as its own dialog closes, which the user can do at any moment — the
+        // switcher stays on screen behind this dialog and has a close button.
+        // So without this, closing the switcher destroys the palette while this
+        // dialog is still up, and pressing Create then calls `newTerminalCreate`
+        // on freed memory.
+        //
+        // That is not hypothetical: it segfaulted a long-running instance on
+        // 2026-08-19, silently at first and fatally once the freed memory had
+        // been handed out to something else.
+        //
+        // `destroyData` runs when the connection goes away with the dialog, so
+        // the palette outlives the dialog by construction rather than by luck.
         _ = NewTerminalDialog.signals.create.connect(
             dialog,
             *Self,
             newTerminalCreate,
-            self,
-            .{},
+            self.ref(),
+            .{ .destroyData = &newTerminalReleasePalette },
         );
+
         dialog.present(self.as(gtk.Widget));
+    }
+
+    /// Release the reference `promptNewTerminal` took, once the New Terminal
+    /// dialog — and with it the `create` connection — is gone.
+    fn newTerminalReleasePalette(self: *Self) callconv(.c) void {
+        self.unref();
     }
 
     fn newTerminalCreate(
@@ -795,6 +817,8 @@ pub const CommandPalette = extern struct {
         const window = self.private().window.get() orelse return;
         defer window.unref();
 
+        // May already be closed, if the switcher was dismissed while this
+        // dialog was open. Closing an already-closed `AdwDialog` is a no-op.
         self.close();
         window.newTabWith(std.mem.span(name), std.mem.span(project));
     }
