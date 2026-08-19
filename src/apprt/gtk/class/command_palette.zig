@@ -177,6 +177,8 @@ pub const CommandPalette = extern struct {
         // ourselves when the palette is closed or an action is activated.
         _ = self.refSink();
 
+        log.info("palette created ptr=0x{x}", .{@intFromPtr(self)});
+
         // Bump the ref so that the caller has a reference.
         return self.ref();
     }
@@ -594,6 +596,8 @@ pub const CommandPalette = extern struct {
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
 
+        log.info("palette disposed ptr=0x{x}", .{@intFromPtr(self)});
+
         // You MUST clear every weak ref here. The target keeps a pointer to the
         // GWeakRef itself, and finalizing the target walks that list and takes
         // a lock inside each entry — so if this object's memory has been freed
@@ -970,12 +974,20 @@ pub const CommandPalette = extern struct {
 
     fn close(self: *CommandPalette) void {
         const priv = self.private();
+        log.info("palette close requested ptr=0x{x}", .{@intFromPtr(self)});
         _ = priv.dialog.close();
     }
 
     fn dialogClosed(_: *adw.Dialog, self: *CommandPalette) callconv(.c) void {
         const priv = self.private();
         priv.open = false;
+
+        // This is where the palette's last reference goes, so this line is the
+        // moment any pointer to it held elsewhere becomes dangling.
+        log.info(
+            "palette dialog closed ptr=0x{x} reopen={}",
+            .{ @intFromPtr(self), priv.reopen != null },
+        );
 
         // A mode switch was requested while the dialog was open. It has now
         // finished closing, so it can be shown again.
@@ -1195,6 +1207,15 @@ pub const CommandPalette = extern struct {
             .{ .destroyData = &newTerminalReleasePalette },
         );
 
+        // Names the palette the dialog will call back into, so that the
+        // `create` line below can be checked against it. The reference taken
+        // above is what makes them the same live object; this is how you would
+        // see it if that ever stopped being true.
+        log.info(
+            "new terminal dialog opened dialog=0x{x} palette=0x{x} name={s} project={s}",
+            .{ @intFromPtr(dialog), @intFromPtr(self), name, project },
+        );
+
         dialog.present(self.as(gtk.Widget));
     }
 
@@ -1210,6 +1231,16 @@ pub const CommandPalette = extern struct {
         project: [*:0]const u8,
         self: *Self,
     ) callconv(.c) void {
+        // Logged *before* the first read of `self`, because that read is the
+        // one that segfaulted on 2026-08-19 when the palette had already been
+        // destroyed. If this line is ever the last thing in the log, the
+        // palette named here was gone by the time it ran — check it against
+        // the `palette disposed` line for the same address.
+        log.info(
+            "new terminal create signal palette=0x{x} name={s} project={s}",
+            .{ @intFromPtr(self), name, project },
+        );
+
         const window = self.private().window.get() orelse return;
         defer window.unref();
 
@@ -1221,6 +1252,11 @@ pub const CommandPalette = extern struct {
 
     fn searchStopped(_: *gtk.SearchEntry, self: *CommandPalette) callconv(.c) void {
         // ESC was pressed - close the palette
+        //
+        // A candidate for what closed the palette behind an open New Terminal
+        // dialog on 2026-08-19: if GtkSearchEntry also emits `stop-search` on
+        // losing focus, presenting the dialog would trip this.
+        log.info("palette search stopped ptr=0x{x}", .{@intFromPtr(self)});
         self.close();
     }
 
@@ -1261,6 +1297,11 @@ pub const CommandPalette = extern struct {
         // Remember where a newly created terminal should go.
         priv.window.set(window);
         priv.open = true;
+
+        log.info(
+            "palette presented ptr=0x{x} window=0x{x}",
+            .{ @intFromPtr(self), @intFromPtr(window) },
+        );
 
         // Show the dialog
         priv.dialog.present(window.as(gtk.Widget));
