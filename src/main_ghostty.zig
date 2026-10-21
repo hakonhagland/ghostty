@@ -162,10 +162,77 @@ fn logFn(
 
         const level_txt = comptime level.asText();
         const prefix = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
-        nosuspend stderr.file_writer.interface.print(level_txt ++ prefix ++ format ++ "\n", args) catch break :stderr;
+        var time_buf: [16]u8 = undefined;
+        const time_txt = localTimeOfDay(&time_buf);
+        nosuspend stderr.file_writer.interface.print(
+            "{s} " ++ level_txt ++ prefix ++ format ++ "\n",
+            .{time_txt} ++ args,
+        ) catch break :stderr;
         nosuspend stderr.file_writer.interface.flush() catch break :stderr;
     }
 }
+
+/// The wall-clock time of day, local, as `HH:MM:SS.mmm`.
+///
+/// Every line of the log carries one. Without it a log is only an ordering,
+/// and the questions actually asked of it are about *when*: how long the gap
+/// before the last line was, and whether a line lines up with a crash that
+/// `coredumpctl` timestamps to the second.
+///
+/// Local rather than UTC because everything it gets compared against —
+/// `coredumpctl`, `journalctl`, `ls -l` — is local. Milliseconds because the
+/// gaps worth seeing are frame-sized.
+fn localTimeOfDay(buf: []u8) []const u8 {
+    const unknown = "--:--:--.---";
+
+    // `localtime_r` is POSIX. Windows has `localtime_s` with a different
+    // signature; not worth the trouble, so those builds simply have no
+    // timestamp rather than a wrong one.
+    if (comptime builtin.target.os.tag == .windows) return unknown;
+
+    // The clock is read through libc rather than `std.Io.Timestamp`, which
+    // wants an `Io` instance this function has no way to obtain: it runs on
+    // any thread, and before and after the global state exists.
+    var ts: Timespec = undefined;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return unknown;
+
+    var tm: Tm = undefined;
+    if (localtime_r(&ts.tv_sec, &tm) == null) return unknown;
+
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
+        @as(u32, @intCast(tm.tm_hour)),
+        @as(u32, @intCast(tm.tm_min)),
+        @as(u32, @intCast(tm.tm_sec)),
+        @as(u32, @intCast(@divTrunc(ts.tv_nsec, 1_000_000))),
+    }) catch unknown;
+}
+
+/// `struct tm` as glibc lays it out. Only the fields up to `tm_isdst` are
+/// standard; the two after it are the GNU extension, and are declared so that
+/// the struct is the right size for `localtime_r` to fill in.
+const Tm = extern struct {
+    tm_sec: c_int,
+    tm_min: c_int,
+    tm_hour: c_int,
+    tm_mday: c_int,
+    tm_mon: c_int,
+    tm_year: c_int,
+    tm_wday: c_int,
+    tm_yday: c_int,
+    tm_isdst: c_int,
+    tm_gmtoff: c_long,
+    tm_zone: ?[*:0]const u8,
+};
+
+const Timespec = extern struct {
+    tv_sec: c_long,
+    tv_nsec: c_long,
+};
+
+const CLOCK_REALTIME: c_int = 0;
+
+extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+extern "c" fn localtime_r(timep: *const c_long, result: *Tm) ?*Tm;
 
 /// Returns the macOS unified logging logger for the given scope. The
 /// logger is created once per scope and cached for the lifetime of the
