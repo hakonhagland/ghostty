@@ -7122,6 +7122,15 @@ pub const Keybinds = struct {
             .toggle_session_search,
         );
 
+        // Copy a gho: link to the current tab. Not ctrl+shift+u: IBus takes
+        // that for typing a Unicode code point, and Ghostty hands every key
+        // to the input method before its own bindings.
+        try self.set.put(
+            alloc,
+            .{ .key = .{ .unicode = 'l' }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .copy_tab_link,
+        );
+
         // Mac-specific keyboard bindings.
         if (comptime builtin.target.os.tag.isDarwin()) {
             try self.set.put(

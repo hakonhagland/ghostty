@@ -31,6 +31,7 @@ const CoreSurface = @import("../../../Surface.zig");
 const ext = @import("../ext.zig");
 const key = @import("../key.zig");
 const session = @import("../session.zig");
+const tab_link = @import("../tab_link.zig");
 const adw_version = @import("../adw_version.zig");
 const gtk_version = @import("../gtk_version.zig");
 const winprotopkg = @import("../winproto.zig");
@@ -804,6 +805,7 @@ pub const Application = extern struct {
             .prompt_title => return Action.promptTitle(target, value),
 
             .prompt_tab_project => return Action.promptTabProject(target),
+            .copy_tab_link => return Action.copyTabLink(target),
 
             .quit => self.quit(),
 
@@ -1061,6 +1063,7 @@ pub const Application = extern struct {
                         s.getFocusSeq()
                     else
                         null,
+                    .id = try alloc.dupe(u8, tab.getTabId()),
                 });
             }
 
@@ -1407,6 +1410,7 @@ pub const Application = extern struct {
                 .working_directory = wd,
                 .title = title,
                 .project = project,
+                .id = tab.id,
             }) orelse continue;
 
             // Remember where this tab belongs in the recency order. Its
@@ -2098,6 +2102,7 @@ pub const Application = extern struct {
             .init("new-tab", actionNewTab, tas_variant_type),
             .init("open-config", actionOpenConfig, s_variant_type),
             .init("present-surface", actionPresentSurface, t_variant_type),
+            .init("focus-tab", actionFocusTab, s_variant_type),
             .init("quit", actionQuit, null),
             .init("reload-config", actionReloadConfig, null),
             .init("toggle-quick-terminal", actionToggleQuickTerminal, null),
@@ -2739,6 +2744,171 @@ pub const Application = extern struct {
         };
 
         _ = self.core().mailbox.push(global.io(), .{ .open_config = target }, .forever);
+    }
+
+    /// `app.focus-tab`: bring the tab named by a `gho:` link to the front, or
+    /// open it again if it has been closed. The parameter is the link target
+    /// as written in the note, `gho:<project>?id=…`; see `tab_link.zig`.
+    ///
+    /// On Wayland a window may only take the focus with an activation token.
+    /// A caller that has one puts it in the call's platform data as
+    /// `activation-token`, and GTK applies it before this runs, so nothing
+    /// here has to deal with it.
+    fn actionFocusTab(
+        _: *gio.SimpleAction,
+        parameter_: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const parameter = parameter_ orelse {
+            log.warn("no parameter provided to app.focus-tab action", .{});
+            return;
+        };
+
+        const s_variant_type = glib.ext.VariantType.newFor([:0]const u8);
+        defer s_variant_type.free();
+        if (parameter.isOfType(s_variant_type) == 0) {
+            log.warn("parameter to app.focus-tab action is of type '{s}' not 's'", .{
+                parameter.getTypeString(),
+            });
+            return;
+        }
+
+        var len: usize = undefined;
+        const buf = parameter.getString(&len);
+        self.focusTabLink(buf[0..len]);
+    }
+
+    fn focusTabLink(self: *Self, target: []const u8) void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator());
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const fields = tab_link.parse(arena, target) catch |err| {
+            log.warn("app.focus-tab: cannot parse link err={} link={s}", .{ err, target });
+            return;
+        };
+
+        // The id is the only thing that is certain to name this tab: the
+        // title, the project and the window name can all have been changed
+        // since the link was copied.
+        if (fields.id) |id| {
+            if (self.findTab(.{ .id = id })) |found| {
+                found.present();
+                return;
+            }
+        }
+
+        // No tab has the id: the link may come from another build, or from
+        // before the state file was lost. Take the tab with the same project
+        // and title, but only when there is exactly one; guessing between two
+        // would be worse than opening a third.
+        if (fields.title) |title| {
+            if (self.findTab(.{ .project_title = .{
+                .project = fields.project,
+                .title = title,
+            } })) |found| {
+                found.present();
+                return;
+            }
+        }
+
+        self.reopenTab(arena, fields) catch |err| {
+            log.warn("app.focus-tab: cannot reopen tab err={}", .{err});
+        };
+    }
+
+    const TabQuery = union(enum) {
+        id: []const u8,
+        project_title: struct {
+            project: ?[]const u8,
+            title: []const u8,
+        },
+    };
+
+    /// A tab and where it is.
+    const FoundTab = struct {
+        window: *Window,
+        index: usize,
+        tab: *Tab,
+
+        /// Select the tab in its window and bring the window to the front.
+        /// Selecting is also what starts a tab that was restored but has not
+        /// been shown yet.
+        ///
+        /// This deliberately does not go through `Surface.present` as the
+        /// session search does: that asks the window to look the surface up
+        /// in its widget tree, and right after a launch, when the restored
+        /// windows have not built their widgets yet, it is not there.
+        fn present(self: FoundTab) void {
+            self.window.selectTabIndex(self.index);
+            if (self.tab.getActiveSurface()) |surface| surface.grabFocus();
+            self.window.as(gtk.Window).present();
+        }
+    };
+
+    /// The tab that matches `query`, in any window. For `.project_title`,
+    /// null unless exactly one tab matches.
+    fn findTab(self: *Self, query: TabQuery) ?FoundTab {
+        var found: ?FoundTab = null;
+        var it: ?*glib.List = self.as(gtk.Application).getWindows();
+        while (it) |node| : (it = node.f_next) {
+            const gtk_window: *gtk.Window = @ptrCast(@alignCast(node.f_data orelse continue));
+            const window = gobject.ext.cast(Window, gtk_window) orelse continue;
+            if (window.isQuickTerminal()) continue;
+            for (0..window.getTabCount()) |i| {
+                const tab = window.getTabAt(i) orelse continue;
+                const here: FoundTab = .{ .window = window, .index = i, .tab = tab };
+                switch (query) {
+                    .id => |id| if (std.mem.eql(u8, tab.getTabId(), id)) return here,
+                    .project_title => |q| {
+                        const title = tab.getTitleOverride() orelse continue;
+                        if (!std.mem.eql(u8, title, q.title)) continue;
+                        const project: []const u8 = tab.getProject() orelse "";
+                        if (!std.mem.eql(u8, project, q.project orelse "")) continue;
+                        if (found != null) return null;
+                        found = here;
+                    },
+                }
+            }
+        }
+        return found;
+    }
+
+    /// Open the tab a link describes, in the window with the link's name if
+    /// there is one, otherwise in the most recently used window. It gets the
+    /// link's id, so the same link finds it from now on.
+    fn reopenTab(self: *Self, arena: Allocator, fields: tab_link.Fields) !void {
+        var target: ?*Window = null;
+        var it: ?*glib.List = self.as(gtk.Application).getWindows();
+        while (it) |node| : (it = node.f_next) {
+            const gtk_window: *gtk.Window = @ptrCast(@alignCast(node.f_data orelse continue));
+            const window = gobject.ext.cast(Window, gtk_window) orelse continue;
+            if (window.isQuickTerminal()) continue;
+
+            // `getWindows` lists the most recently focused window first.
+            if (target == null) target = window;
+            const want = fields.window orelse break;
+            const name = window.getWindowName() orelse continue;
+            if (std.mem.eql(u8, name, want)) {
+                target = window;
+                break;
+            }
+        }
+
+        const window = target orelse {
+            log.warn("app.focus-tab: no window to open the tab in", .{});
+            return;
+        };
+
+        _ = window.restoreTab(.{
+            .working_directory = try dupeOptZ(arena, fields.dir),
+            .title = try dupeOptZ(arena, fields.title),
+            .project = try dupeOptZ(arena, fields.project),
+            .id = fields.id,
+        }) orelse return;
+
+        // `restoreTab` has selected the new tab already.
+        window.as(gtk.Window).present();
     }
 
     fn actionPresentSurface(
@@ -3576,6 +3746,24 @@ const Action = struct {
                         return true;
                     },
                 }
+            },
+        }
+    }
+
+    pub fn copyTabLink(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |v| {
+                const surface = v.rt_surface.surface;
+                const tab = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse {
+                    log.warn("surface is not in a tab, ignoring copy_tab_link", .{});
+                    return false;
+                };
+                const window = ext.getAncestor(Window, surface.as(gtk.Widget)) orelse {
+                    log.warn("surface is not in a window, ignoring copy_tab_link", .{});
+                    return false;
+                };
+                return window.copyTabLink(tab);
             },
         }
     }

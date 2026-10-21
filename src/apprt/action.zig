@@ -230,6 +230,10 @@ pub const Action = union(Key) {
     /// something only the GTK apprt implements.
     prompt_tab_project,
 
+    /// Copy a `gho:` link to the target's tab to the clipboard. Only the GTK
+    /// apprt implements it. See `copy_tab_link` in `input/Binding.zig`.
+    copy_tab_link,
+
     /// The current working directory has changed for the target terminal.
     pwd: Pwd,
 
@@ -413,6 +417,7 @@ pub const Action = union(Key) {
         set_window_title,
         prompt_title,
         prompt_tab_project,
+        copy_tab_link,
         pwd,
         mouse_shape,
         mouse_visibility,

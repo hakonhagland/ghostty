@@ -18,6 +18,8 @@ const SplitTree = @import("split_tree.zig").SplitTree;
 const Surface = @import("surface.zig").Surface;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
 const project_color = @import("../project_color.zig");
+const tab_link = @import("../tab_link.zig");
+const global = @import("../../../global.zig");
 
 const log = std.log.scoped(.gtk_ghostty_window);
 
@@ -209,6 +211,11 @@ pub const Tab = extern struct {
         /// the `@project` prefix accepted by the switcher.
         project: ?[:0]const u8 = null,
 
+        /// A name for this tab that stays the same across restarts, so that a
+        /// `gho:` link can find it again. Made on first use by `getTabId`, or
+        /// set from the saved session by `setTabId`. See `tab_link.zig`.
+        tab_id: ?[:0]const u8 = null,
+
         /// How much room the title has, in characters. Set by the window from
         /// the tab bar's actual width divided by the number of tabs.
         title_budget: c_uint = 0,
@@ -313,6 +320,39 @@ pub const Tab = extern struct {
     /// The project this tab belongs to, if the user has assigned one.
     pub fn getProject(self: *Self) ?[:0]const u8 {
         return self.private().project;
+    }
+
+    /// This tab's persistent id, made now if it has none yet. A tab that is
+    /// restored gets its saved id from `setTabId` before anything asks for it.
+    pub fn getTabId(self: *Self) [:0]const u8 {
+        const priv = self.private();
+        if (priv.tab_id) |v| return v;
+
+        var buf: [tab_link.id_len + 1]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        const now = glib.DateTime.newNowLocal();
+        defer if (now) |n| n.unref();
+        const stamp: ?[*:0]u8 = if (now) |n| n.format("%y%m%d%H%M%S") else null;
+        defer if (stamp) |v| glib.free(v);
+        const rng_impl: std.Random.IoSource = .{ .io = global.io() };
+        tab_link.writeId(
+            &w,
+            if (stamp) |v| std.mem.span(v) else "000000000000",
+            rng_impl.interface(),
+        ) catch unreachable;
+        priv.tab_id = glib.ext.dupeZ(u8, w.buffered());
+        return priv.tab_id.?;
+    }
+
+    /// Give this tab a known id: the saved one on restore, or the one in a
+    /// `gho:` link when the link reopens a tab that was closed.
+    pub fn setTabId(self: *Self, id: ?[]const u8) void {
+        const priv = self.private();
+        if (priv.tab_id) |v| glib.free(@ptrCast(@constCast(v)));
+        priv.tab_id = null;
+        if (id) |v| {
+            if (v.len > 0) priv.tab_id = glib.ext.dupeZ(u8, v);
+        }
     }
 
     /// Set how many characters of title this tab can show. Recomputed on every
@@ -536,6 +576,10 @@ pub const Tab = extern struct {
         if (priv.title_override) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.title_override = null;
+        }
+        if (priv.tab_id) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.tab_id = null;
         }
 
         gobject.Object.virtual_methods.finalize.call(

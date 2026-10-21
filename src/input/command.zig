@@ -477,6 +477,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Prompt for the project the current tab belongs to. Leave blank to remove it from its project."),
         }},
 
+        .copy_tab_link => comptime &.{.{
+            .action = .copy_tab_link,
+            .title = i18n.N_("Copy Link to Tab"),
+            .description = i18n.N_("Copy a gho: link that brings this tab back to the front from another program."),
+        }},
+
         .new_split => comptime &.{
             .{
                 .action = .{ .new_split = .left },

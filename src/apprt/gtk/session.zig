@@ -101,6 +101,11 @@ pub const State = struct {
         /// happened to be recreated in, which is not an order the user has ever
         /// seen.
         focus_seq: ?u64 = null,
+
+        /// The tab's persistent id, which a `gho:` link uses to find it (see
+        /// `tab_link.zig`). Specific to this fork. Null for a tab saved before
+        /// this field existed; such a tab gets a fresh id when restored.
+        id: ?[]const u8 = null,
     };
 
     /// True when there is nothing worth writing. We never overwrite a good

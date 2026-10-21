@@ -30,6 +30,7 @@ const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
+const tab_link = @import("../tab_link.zig");
 
 const log = std.log.scoped(.gtk_ghostty_window);
 
@@ -450,6 +451,7 @@ pub const Window = extern struct {
             .init("prompt-context-tab-title", actionPromptContextTabTitle, null),
             .init("prompt-window-title", actionPromptWindowTitle, null),
             .init("prompt-context-tab-project", actionPromptContextTabProject, null),
+            .init("copy-context-tab-link", actionCopyContextTabLink, null),
             .init("ring-bell", actionRingBell, null),
             .init("split-right", actionSplitRight, null),
             .init("split-left", actionSplitLeft, null),
@@ -890,6 +892,7 @@ pub const Window = extern struct {
         working_directory: ?[:0]const u8 = null,
         title: ?[:0]const u8 = null,
         project: ?[:0]const u8 = null,
+        id: ?[]const u8 = null,
     }) ?*Tab {
         const page = self.newTabPage(
             null,
@@ -906,8 +909,48 @@ pub const Window = extern struct {
 
         if (saved.project) |p| tab.setProject(p);
         if (saved.title) |t| tab.setTitleOverride(t);
+        if (saved.id) |id| tab.setTabId(id);
 
         return tab;
+    }
+
+    /// Copy a `gho:` link to `tab`, one of this window's tabs, to the
+    /// clipboard. The link records what is needed to find the tab again (its
+    /// id) and to open it again once it is closed (project, title, directory
+    /// and this window's name). See `tab_link.zig`.
+    pub fn copyTabLink(self: *Self, tab: *Tab) bool {
+        const surface = tab.getActiveSurface() orelse return false;
+        const alloc = Application.default().allocator();
+
+        const dir: ?[]const u8 = if (surface.getPwd()) |p|
+            (if (p.len > 0) p else null)
+        else
+            null;
+        const title = tab.getTitleOverride();
+
+        // The link text is only for reading. The user's own name for the tab
+        // says the most; failing that, the directory it is in.
+        const label: []const u8 = title orelse
+            if (dir) |d| std.fs.path.basename(d) else "tab";
+
+        var buf: std.Io.Writer.Allocating = .init(alloc);
+        defer buf.deinit();
+        tab_link.writeLink(&buf.writer, label, .{
+            .id = tab.getTabId(),
+            .project = tab.getProject(),
+            .title = title,
+            .dir = dir,
+            .window = self.getWindowName(),
+        }) catch return false;
+        buf.writer.writeByte(0) catch return false;
+        const written = buf.written();
+        const text: [:0]const u8 = written[0 .. written.len - 1 :0];
+
+        surface.setClipboard(.standard, &.{.{
+            .mime = "text/plain",
+            .data = text,
+        }}, false);
+        return true;
     }
 
     /// Select the tab at `index`, counting from zero. Out-of-range indices are
@@ -2754,6 +2797,15 @@ pub const Window = extern struct {
     ) callconv(.c) void {
         const tab = self.contextMenuTab() orelse return;
         tab.promptTabProject();
+    }
+
+    fn actionCopyContextTabLink(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const tab = self.contextMenuTab() orelse return;
+        _ = self.copyTabLink(tab);
     }
 
     /// The tab the tab-bar context menu was opened on.

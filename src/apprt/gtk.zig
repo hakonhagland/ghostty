@@ -15,4 +15,5 @@ test {
     _ = @import("gtk/key.zig");
     _ = @import("gtk/portal.zig");
     _ = @import("gtk/session.zig");
+    _ = @import("gtk/tab_link.zig");
 }

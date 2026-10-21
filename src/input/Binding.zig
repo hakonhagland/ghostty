@@ -621,6 +621,14 @@ pub const Action = union(enum) {
     /// tab bar, and it is what the session search's `@name` filter matches.
     prompt_tab_project,
 
+    /// Copy a `gho:` link to the current tab to the clipboard, as a markdown
+    /// link. Another program can hand the link back to Ghostty later (see
+    /// the `focus-tab` application action) to bring this tab to the front,
+    /// or to open it again in the same directory if it has been closed.
+    ///
+    /// Only implemented on Linux.
+    copy_tab_link,
+
     /// Set the title for the current focused surface.
     ///
     /// If the title is empty, the surface title is reset to an empty title.
@@ -1431,6 +1439,7 @@ pub const Action = union(enum) {
             .prompt_tab_title,
             .prompt_window_title,
             .prompt_tab_project,
+            .copy_tab_link,
             .set_surface_title,
             .set_tab_title,
             .set_window_title,
